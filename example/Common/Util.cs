@@ -28,10 +28,20 @@ namespace PasswordManagerAccess.Example.Common
         // url: https://lebowski.com
         public static Dictionary<string, string> ReadConfig(string filename)
         {
-            return File.ReadAllLines(filename)
+            return ParseConfig(File.ReadAllLines(filename));
+        }
+
+        public static Dictionary<string, string> ParseConfig(string contents)
+        {
+            return ParseConfig(contents.Split('\n'));
+        }
+
+        public static Dictionary<string, string> ParseConfig(string[] lines)
+        {
+            return lines
                 .Select(line => line.Trim())
                 .Where(line => line.Length > 0 && !line.StartsWith("#"))
-                .Select(line => line.Split(new[] {':'}, 2))
+                .Select(line => line.Split(new[] { ':' }, 2))
                 .Where(parts => parts.Length == 2)
                 .ToDictionary(parts => parts[0].Trim(), parts => parts[1].Trim());
         }

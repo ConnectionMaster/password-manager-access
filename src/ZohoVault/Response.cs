@@ -8,7 +8,7 @@ using Newtonsoft.Json;
 
 namespace PasswordManagerAccess.ZohoVault.Response
 {
-    internal struct ResponseEnvelope<T>
+    internal class ResponseEnvelope<T>
     {
         [JsonProperty("operation", Required = Required.Always)]
         public readonly Operation<T> Operation;
@@ -16,28 +16,34 @@ namespace PasswordManagerAccess.ZohoVault.Response
         public T Payload => Operation.Details;
     }
 
-    internal struct Operation<T>
+    internal class OperationStatus
     {
         [JsonProperty("name", Required = Required.Always)]
         public readonly string Name;
 
         [JsonProperty("result", Required = Required.Always)]
         public readonly Result Result;
+    }
 
-        [JsonProperty("details", Required = Required.Always)]
+    internal class Operation<T> : OperationStatus
+    {
+        [JsonProperty("details")]
         public readonly T Details;
     }
 
-    internal struct Result
+    internal class Result
     {
         [JsonProperty("status", Required = Required.Always)]
         public readonly string Status;
 
         [JsonProperty("message", Required = Required.Always)]
         public readonly string Message;
+
+        [JsonProperty("error_code")]
+        public readonly string ErrorCode;
     }
 
-    internal struct AuthInfo
+    internal class AuthInfo
     {
         [JsonProperty("LOGIN", Required = Required.Always)]
         public readonly string KdfMethod;
@@ -52,7 +58,7 @@ namespace PasswordManagerAccess.ZohoVault.Response
         public readonly string Salt;
     }
 
-    internal struct Vault
+    internal class Vault
     {
         [JsonProperty("SECRETS", Required = Required.Always)]
         public readonly Secret[] Secrets;
@@ -120,7 +126,7 @@ namespace PasswordManagerAccess.ZohoVault.Response
         public readonly string Message;
     }
 
-    internal class Lookup: Status
+    internal class Lookup : Status
     {
         [JsonProperty("lookup")]
         public readonly LookupResult Result;
@@ -140,7 +146,10 @@ namespace PasswordManagerAccess.ZohoVault.Response
         [JsonProperty("digest", Required = Required.Always)]
         public readonly string Digest;
 
-        [JsonProperty("dc", Required = Required.Always)]
+        [JsonProperty("href", Required = Required.Always)]
+        public readonly string Href;
+
+        [JsonProperty("dc")]
         public readonly string DataCenter;
     }
 
@@ -155,7 +164,7 @@ namespace PasswordManagerAccess.ZohoVault.Response
         public readonly string DataCenter;
     }
 
-    internal class LogIn: Status
+    internal class LogIn : Status
     {
         [JsonProperty("passwordauth")]
         public readonly LogInResult Result;
@@ -185,9 +194,7 @@ namespace PasswordManagerAccess.ZohoVault.Response
         public readonly MfaYubikey Yubikey;
     }
 
-    internal class MfaTotp
-    {
-    }
+    internal class MfaTotp { }
 
     internal class MfaYubikey
     {
@@ -195,7 +202,7 @@ namespace PasswordManagerAccess.ZohoVault.Response
         public readonly string Name;
     }
 
-    internal class Totp: Status
+    internal class Totp : Status
     {
         [JsonProperty("totpsecauth")]
         public readonly TotpResult Result;
@@ -207,7 +214,7 @@ namespace PasswordManagerAccess.ZohoVault.Response
         public readonly string Status;
     }
 
-    internal class TrustMfa: Status
+    internal class TrustMfa : Status
     {
         [JsonProperty("trustmfa")]
         public readonly TrustMfaResult Result;

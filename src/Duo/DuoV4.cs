@@ -1,45 +1,53 @@
 // Copyright (C) Dmitry Yakimenko (detunized@gmail.com).
 // Licensed under the terms of the MIT license. See LICENCE for details.
 
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using HtmlAgilityPack;
 using PasswordManagerAccess.Common;
-using static PasswordManagerAccess.Duo.Util;
 using R = PasswordManagerAccess.Duo.ResponseV4;
 
 namespace PasswordManagerAccess.Duo
 {
     internal static class DuoV4
     {
-        public static Result Authenticate(string authUrl, IDuoUi ui, IRestTransport transport)
+        public static Result Authenticate(string authUrl, IDuoUi ui, IRestTransport transport, ISimpleLogger logger = null)
         {
-            var rest = new RestClient(transport);
+            var rest = new RestClient(transport, logger: logger);
 
             // 1. First get the main page
             var (html, url, cookies) = GetMainHtml(authUrl, rest);
 
-            // 2. The main page contains the form that we need to POST to
+            // 2. Detect a redirect to V1
+            if (url.Contains("/frame/frameless/v3/auth"))
+                return Result.RedirectToV1;
+
+            // 3. The main page contains the form that we need to POST to
             string host;
             (host, cookies) = SubmitSystemProperties(html, url, cookies, rest);
 
-            // 3. Get `sid`
+            // 4. Get `sid`
             var sessionId = ExtractSessionId(url);
 
-            // 4. Extract `xsrf` token. It's used in some requests.
+            // 5. Extract `xsrf` token. It's used in some requests.
             var xsrf = ExtractXsrf(html);
 
-            // 5. New rest with the API host
-            var apiRest = new RestClient(transport,
-                                         $"https://{host}/frame/v4/",
-                                         defaultHeaders: new Dictionary<string, string>
-                                         {
-                                             ["X-Xsrftoken"] = xsrf,
-                                         },
-                                         defaultCookies: cookies);
+            // 6. New rest with the API host
+            var apiRest = new RestClient(
+                transport,
+                $"https://{host}/frame/v4/",
+                defaultHeaders: new Dictionary<string, string> { ["X-Xsrftoken"] = xsrf },
+                defaultCookies: cookies,
+                logger: logger
+            );
 
-            // 6. Get available devices and their methods
+            // 7. Get available devices and their methods
             var devices = GetDevices(sessionId, apiRest);
+
+            // There should be at least one device to continue
+            if (devices.Length == 0)
+                throw Util.MakeInvalidResponseError("no devices are registered for authentication");
 
             while (true)
             {
@@ -65,14 +73,14 @@ namespace PasswordManagerAccess.Duo
                         return null; // Canceled by user
                 }
 
-                var token = SubmitFactorAndWaitForToken(sessionId, xsrf, choice, passcode, ui, apiRest);
+                var result = SubmitFactorAndWaitForResult(sessionId, xsrf, choice, passcode, ui, apiRest);
 
                 // Flow error like an incorrect passcode. The UI has been updated with the error. Keep going.
-                if (token.IsNullOrEmpty())
+                if (result == null)
                     continue;
 
                 // All good
-                return new Result(token, choice.RememberMe);
+                return new Result(result.Code, result.State, choice.RememberMe);
             }
         }
 
@@ -80,27 +88,26 @@ namespace PasswordManagerAccess.Duo
         // Internal
         //
 
-        internal static (HtmlDocument Html, string RedirectUrl, Dictionary<string, string> Cookies) GetMainHtml(
-            string authUrl,
-            RestClient rest)
+        internal static (HtmlDocument Html, string RedirectUrl, Dictionary<string, string> Cookies) GetMainHtml(string authUrl, RestClient rest)
         {
             var response = rest.Get(authUrl);
             if (!response.IsSuccessful)
-                throw MakeSpecializedError(response);
+                throw Util.MakeSpecializedError(response);
 
-            return (Parse(response.Content), response.RequestUri.AbsoluteUri, response.Cookies);
+            return (Util.Parse(response.Content), response.RequestUri.AbsoluteUri, response.Cookies);
         }
 
         internal static (string Host, Dictionary<string, string> Cookies) SubmitSystemProperties(
             HtmlDocument html,
             string url,
             Dictionary<string, string> cookies,
-            RestClient rest)
+            RestClient rest
+        )
         {
             // Find the main form
             var form = html.DocumentNode.SelectSingleNode("//form[@id='plugin_form']");
             if (form == null)
-                throw MakeInvalidResponseError("Duo HTML: the main form is not found");
+                throw Util.MakeInvalidResponseError("Duo HTML: the main form is not found");
 
             // Assign the known values. There are might be others defaulted to "". We're going to ignore them as long
             // as it doesn't break the process.
@@ -120,25 +127,22 @@ namespace PasswordManagerAccess.Duo
 
             var response = rest.PostForm(url, properties, cookies: cookies);
             if (!response.IsSuccessful)
-                throw MakeSpecializedError(response);
+                throw Util.MakeSpecializedError(response);
 
             return (response.RequestUri.Host, response.Cookies);
         }
 
         internal static string ExtractSessionId(string url)
         {
-            return ExtractQueryParameter(url, "sid") ??
-                   throw MakeInvalidResponseError("failed to find the session ID parameter in the URL");
+            return Url.ExtractQueryParameter(url, "sid") ?? throw Util.MakeInvalidResponseError("failed to find the session ID parameter in the URL");
         }
 
         internal static string ExtractXsrf(HtmlDocument html)
         {
-            var xsrf = html.DocumentNode
-                .SelectSingleNode("//form[@id='plugin_form']/input[@name='_xsrf']")?
-                .GetAttributeValue("value", "");
+            var xsrf = html.DocumentNode.SelectSingleNode("//form[@id='plugin_form']/input[@name='_xsrf']")?.GetAttributeValue("value", "");
 
             if (xsrf.IsNullOrEmpty())
-                throw MakeInvalidResponseError("failed to find the 'xsrf' token");
+                throw Util.MakeInvalidResponseError("failed to find the 'xsrf' token");
 
             return xsrf;
         }
@@ -147,16 +151,17 @@ namespace PasswordManagerAccess.Duo
         {
             var response = rest.Get<Response.Envelope<R.Data>>($"auth/prompt/data?post_auth_action=OIDC_EXIT&sid={sessionId}");
             if (!response.IsSuccessful)
-                throw MakeSpecializedError(response);
+                throw Util.MakeSpecializedError(response);
 
             return ParseDeviceData(response.Data.Payload);
         }
 
         internal static DuoDevice[] ParseDeviceData(R.Data data)
         {
-            return data.Phones
-                .Select(x => new DuoDevice(id: x.Id, name: x.Name, GetDeviceFactors(x.Key, data.Methods)))
-                .ToArray();
+            if (data.Phones == null)
+                return Array.Empty<DuoDevice>();
+
+            return data.Phones.Select(x => new DuoDevice(id: x.Id, name: x.Name, GetDeviceFactors(x.Key, data.Methods))).ToArray();
         }
 
         internal static DuoFactor[] GetDeviceFactors(string key, R.Method[] methods)
@@ -174,34 +179,41 @@ namespace PasswordManagerAccess.Duo
             {
                 ["sid"] = sid,
                 ["device"] = choice.Device.Id,
-                ["factor"] = GetFactorParameterValue(choice.Factor),
+                ["factor"] = Util.GetFactorParameterValue(choice.Factor),
                 ["postAuthDestination"] = "OIDC_EXIT",
             };
 
             if (!passcode.IsNullOrEmpty())
                 parameters["passcode"] = passcode;
 
-            var response = PostForm<Response.SubmitFactor>("prompt", parameters, rest);
+            var response = Util.PostForm<Response.SubmitFactor>("prompt", parameters, rest);
             return response.TransactionId ?? "";
+        }
+
+        internal class CodeState
+        {
+            public string Code { get; }
+            public string State { get; }
+
+            public CodeState(string code, string state)
+            {
+                Code = code;
+                State = state;
+            }
         }
 
         // Returns null when a recoverable flow error (like incorrect code or time out) happened
         // TODO: Don't return null, use something more obvious
-        internal static string SubmitFactorAndWaitForToken(string sid,
-                                                           string xsrf,
-                                                           DuoChoice choice,
-                                                           string passcode,
-                                                           IDuoUi ui,
-                                                           RestClient rest)
+        internal static CodeState SubmitFactorAndWaitForResult(string sid, string xsrf, DuoChoice choice, string passcode, IDuoUi ui, RestClient rest)
         {
             var txid = SubmitFactor(sid, choice, passcode, rest);
             if (txid.IsNullOrEmpty())
-                throw MakeInvalidResponseError("transaction ID (txid) is expected but wasn't found");
+                throw Util.MakeInvalidResponseError("transaction ID (txid) is expected but wasn't found");
 
             if (!PollForResultUrl(sid, txid, ui, rest))
                 return null;
 
-            return FetchCode(sid, txid, xsrf, choice, rest);
+            return FetchResult(sid, txid, xsrf, choice, rest);
         }
 
         internal static bool PollForResultUrl(string sid, string txid, IDuoUi ui, RestClient rest)
@@ -212,41 +224,39 @@ namespace PasswordManagerAccess.Duo
             // returns the result. This number here just to prevent an infinite loop, which is never a good idea.
             for (var i = 0; i < maxPollAttempts; i += 1)
             {
-                var response = PostForm<R.Status>("status",
-                                                  new Dictionary<string, object>
-                                                  {
-                                                      ["sid"] = sid,
-                                                      ["txid"] = txid,
-                                                  },
-                                                  rest,
-                                                  new Dictionary<string, string>
-                                                  {
-                                                      ["User-Agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:109.0) Gecko/20100101 Firefox/112.0",
-                                                      ["Accept"] = "*/*",
-                                                      ["Accept-Language"] = "en-US,en;q=0.5",
-                                                      ["Accept-Encoding"] = "gzip, deflate, br",
-                                                      // TODO: Fix host
-                                                      ["Referer"] = $"https://api-005dde75.duosecurity.com/frame/v4/auth/prompt?sid={sid}",
-                                                      ["Sec-Fetch-Dest"] = "empty",
-                                                      ["Sec-Fetch-Mode"] = "cors",
-                                                      ["Sec-Fetch-Site"] = "same-origin",
-                                                  });
+                var response = Util.PostForm<R.Status>(
+                    "status",
+                    new Dictionary<string, object> { ["sid"] = sid, ["txid"] = txid },
+                    rest,
+                    new Dictionary<string, string>
+                    {
+                        ["User-Agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:109.0) Gecko/20100101 Firefox/112.0",
+                        ["Accept"] = "*/*",
+                        ["Accept-Language"] = "en-US,en;q=0.5",
+                        ["Accept-Encoding"] = "gzip, deflate, br",
+                        // TODO: Fix host
+                        ["Referer"] = $"https://api-005dde75.duosecurity.com/frame/v4/auth/prompt?sid={sid}",
+                        ["Sec-Fetch-Dest"] = "empty",
+                        ["Sec-Fetch-Mode"] = "cors",
+                        ["Sec-Fetch-Site"] = "same-origin",
+                    }
+                );
 
                 var (status, text) = GetResponseStatus(response);
-                UpdateUi(status, text, ui);
+                Util.UpdateUi(status, text, ui);
 
                 switch (status)
                 {
-                case DuoStatus.Success:
-                    return true;
-                case DuoStatus.Error:
-                    return false;
+                    case DuoStatus.Success:
+                        return true;
+                    case DuoStatus.Error:
+                        return false;
                 }
 
                 // TODO: Need to sleep or wait here!
             }
 
-            throw MakeInvalidResponseError("expected to receive a valid result or error, got none of it");
+            throw Util.MakeInvalidResponseError("expected to receive a valid result or error, got none of it");
         }
 
         internal static (DuoStatus Status, string Text) GetResponseStatus(R.Status response)
@@ -261,29 +271,37 @@ namespace PasswordManagerAccess.Duo
             return (status, response.Reason ?? response.Code ?? "");
         }
 
-        internal static string FetchCode(string sid, string txid, string xsrf, DuoChoice choice, RestClient rest)
+        internal static CodeState FetchResult(string sid, string txid, string xsrf, DuoChoice choice, RestClient rest)
         {
-            var response = rest.PostForm("oidc/exit",
-                                         new Dictionary<string, object>
-                                         {
-                                             ["sid"] = sid,
-                                             ["txid"] = txid,
-                                             ["factor"] = GetFactorParameterValue(choice.Factor),
-                                             ["device_key"] = choice.Device.Id,
-                                             ["_xsrf"] = xsrf,
-                                             ["dampen_choice"] = "false",
-                                         });
+            var response = rest.PostForm(
+                "oidc/exit",
+                new Dictionary<string, object>
+                {
+                    ["sid"] = sid,
+                    ["txid"] = txid,
+                    ["factor"] = Util.GetFactorParameterValue(choice.Factor),
+                    ["device_key"] = choice.Device.Id,
+                    ["_xsrf"] = xsrf,
+                    ["dampen_choice"] = "false",
+                }
+            );
 
             if (!response.IsSuccessful)
-                throw MakeSpecializedError(response);
+                throw Util.MakeSpecializedError(response);
 
-            return ExtractCode(response.RequestUri.AbsoluteUri);
+            return ExtractResult(response.RequestUri.AbsoluteUri);
         }
 
-        internal static string ExtractCode(string redirectUrl)
+        internal static CodeState ExtractResult(string redirectUrl)
         {
-            return ExtractQueryParameter(redirectUrl, "duo_code") ??
-                   throw MakeInvalidResponseError($"failed to find the 'duo_code' auth token");
+            var code =
+                Url.ExtractQueryParameter(redirectUrl, "code")
+                ?? Url.ExtractQueryParameter(redirectUrl, "duo_code")
+                ?? throw Util.MakeInvalidResponseError("failed to find the 'duo_code' auth token");
+
+            var state = Url.ExtractQueryParameter(redirectUrl, "state") ?? "";
+
+            return new CodeState(code, state);
         }
 
         //

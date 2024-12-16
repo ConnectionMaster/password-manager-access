@@ -1,5 +1,145 @@
 # Changelog
 
+## 21.0.4
+  - Dashlane: bumped the client version to get rid of the "unsupported" error
+
+## 21.0.3
+  - ProtonPass: fixed a bug that occured when both 2FA and the extra password were used with no
+    stored access tokens
+
+## 21.0.2
+  - ProtonPass: fixed a bug that occured sometimes while parsing the FIDO2 2FA settings
+
+## 21.0.1
+  - 1Password: fixed a bug with WebAuthn 2FA on non .com domains
+
+## 21.0.0
+  - ProtonPass: added support for the extra password to unlock the vault
+  - ProtonPass: added support for the 2FA Google Authenticator (TOTP) method
+
+## 20.0.1
+  - LastPass: fixed a problem with the new logging feature that was causing a crash in some situations
+
+## 20.0.0
+  - 1Password: added GetPrivateKey method to convert between different formats of private keys
+    (OpenSSH, PKCS#8, PKCS#1 are supported)
+  - 1Password: SshKey.Key removed as it was confusing
+
+## 19.3.0
+  - 1Password: added support for SSH keys stored in the vault (see `Vault.SshKeys`)
+
+## 19.2.2
+  - LastPass: added even more filters to remove sensitive information from the log
+
+## 19.2.1
+  - LastPass: added more filters to remove sensitive information from the log
+
+## 19.2.0
+  - LastPass: added a logging facility via ISecureLogger interface. In addition to that the log is
+    attached to the exception in case of a failure. Controlled by `ParserOptions.EnabledLogging`.
+
+## 19.1.5
+  - ZohoVault: fixed a different problem with login on Android
+
+## 19.1.4
+  - ZohoVault: fixed a problem with login that sometimes occured on iOS and Android .NET 8 platforms
+
+## 19.1.0
+  - Bitwarden: added support for custom fields in the vault accounts (see `Account.CustomFields`)
+
+## 19.0.0
+  - All: removed all the legacy .NET platforms namely .NET Framework 4.8, .NET Standard 2.0 and all
+    Mono based variants. Only .NET 6.0 and 8.0 are supported now.
+  - All: all dependencies are upgraded to the latest versions
+  - All: the assembly version is properly set now in the release DLLs
+
+## 18.0.0
+  - ZohoVault: added cookie-based session storage to save on "full logins". See `ZohoVault.Settings`.
+
+## 17.0.0
+  - ProtonPass: initial release (see preview releases for the changes)
+  - Bitwarden: added support for the new encryption scheme with individual keys for each item
+
+## 17.0.0-preview.3
+  - ProtonPass: added vault ID (see Vault.Id)
+  - ProtonPass: trashed items are now ignored
+
+## 17.0.0-preview.2
+  - ProtonPass: added support for multiple vaults (Vault.Open -> Vault.OpenAll)
+
+## 17.0.0-preview
+  - ProtonPass: added support for the ProtonPass password manager. This is a preview release and the
+    API is subject to change. Currently only the basic features are supported: single vault, no
+    sharing, no MFA. This is the first async module in the library.
+  - All: new dependency: RestSharp 110.2.0
+  - All: new dependency: BCrypt.Net-Next 4.0.3
+  - All: new dependency: PgpCore 6.4.1
+  - All: new dependency: Google.Protobuf 3.27.1
+  - All: upgraded BouncyCastle.Cryptography to 2.4.0
+  - All: fixed all warnings in the code
+
+## 16.2.0
+  - LastPass: added support for the URL field encryption
+
+## 16.1.0
+  - Bitwarden: added support for the Duo V4 and the universal prompt
+  - Bitwarden: fixed the interactive browser mode that only requires th username and the password
+    to log in
+  - LastPass: added support for the Duo V4 and the universal prompt
+  - Duo: added support for the traditional prompt detection
+  - Duo: added better error handling in the situations when no devices are added
+
+## 16.0.0
+  - Dropbox Passwords: added Client UI methods to allow the user to cancel and re-trigger the device
+    enrollment process
+  - Dropbox Passwords: improve enrollment process handling, allow longer enrollment sequences
+
+## 15.0.0
+  - Dropbox Passwords: added the device name configuration options, this name is displayed to
+    the user during the login sequence
+
+## 14.1.3
+  - Dashlane: fixed a login problem with malformed email 2FA tokens
+  - Dashlane: fixed the resend email token functionality
+
+## 14.1.2
+  - Dashlane: fixed a login problem when email 2FA tokens were used
+
+## 14.1.1
+  - Dashlane: updated the login protocol, which fixes recent login problems
+
+## 14.1.0
+  - ZohoVault: added support for any region, not only a fixed list of data centers. zohocloud.ca and
+    other previously unsupported regions work now.
+
+## 14.0.1
+  - LastPass: fixed a rare problem with the vault parsing
+
+## 14.0.0
+  - Dropbox Passwords: initial release
+
+## 13.2.0
+  - 1Password: added support for multiple WebAuthn keys
+
+## 13.1.1
+  - ZohoVault: fixed a problem at login that started happening recently after the protocol change
+
+## 13.1.0
+  - Global: Bouncy Castle dependency added to `net48` and `netstandard2.0` targets (not to `net6.0`)
+    in the main project file
+  - 1Password: added support for RSA-OAEP-256 encryption (via Bouncy Castle on Mono and
+    `netstandard2.0` platforms)
+  - 1Password: OTP fields are parsed and are available now via `Account.Otps` property
+  - 1Password: fixed parsing of some specific fields that were causing crashes before, like the
+    address or "sign with" fields
+  - 1Password: fixed a BadRequest HTTP 400 error on Xamarin/Android
+
+## 13.0.0
+  - 1Password: service account support. API breaking change! Please check the provided example
+    program for the new API. Mainly the `ClientInfo` class is split into `Credentials` and
+    `AppInfo`. `Credentials` is used only in the regular login mode. To use the service account mode
+    see the `ServiceAccount` overload.
+
 ## 12.3.0
   - Bitwarden: Argon2id KDF support added
 

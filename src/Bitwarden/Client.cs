@@ -15,9 +15,10 @@ using R = PasswordManagerAccess.Bitwarden.Response;
 
 namespace PasswordManagerAccess.Bitwarden
 {
-
     internal static class Client
     {
+        // This is so-called "browser" mode. It's not really trying to mimic a browser, but rather the CLI
+        // in the "browser" mode, where the username and the password and, possibly, 2FA are used to log in.
         public static (Account[], Collection[], Organization[], ParseError[]) OpenVaultBrowser(
             string username,
             string password,
@@ -25,7 +26,8 @@ namespace PasswordManagerAccess.Bitwarden
             string baseUrl,
             IUi ui,
             ISecureStorage storage,
-            IRestTransport transport)
+            IRestTransport transport
+        )
         {
             var rest = MakeRestClients(baseUrl, transport);
 
@@ -48,13 +50,15 @@ namespace PasswordManagerAccess.Bitwarden
             return DecryptVault(encryptedVault, key);
         }
 
+        // This mode a true non-interactive CLI/API mode. The 2FA is not used in this mode.
         public static (Account[], Collection[], Organization[], ParseError[]) OpenVaultCliApi(
             string clientId,
             string clientSecret,
             string password,
             string deviceId,
             string baseUrl,
-            IRestTransport transport)
+            IRestTransport transport
+        )
         {
             var rest = MakeRestClients(baseUrl, transport);
 
@@ -89,14 +93,15 @@ namespace PasswordManagerAccess.Bitwarden
                 identityUrl = baseUrlNoSlash + "/identity";
             }
 
-            return (Api: new RestClient(transport, apiUrl, defaultHeaders: DefaultRestHeaders),
-                    Identity: new RestClient(transport, identityUrl, defaultHeaders: DefaultRestHeaders));
+            return (
+                Api: new RestClient(transport, apiUrl, defaultHeaders: DefaultRestHeaders),
+                Identity: new RestClient(transport, identityUrl, defaultHeaders: DefaultRestHeaders)
+            );
         }
 
         internal static R.KdfInfo RequestKdfInfo(string username, RestClient rest)
         {
-            var response = rest.PostJson<R.KdfInfo>("accounts/prelogin",
-                                                    new Dictionary<string, object> { { "email", username } });
+            var response = rest.PostJson<R.KdfInfo>("accounts/prelogin", new Dictionary<string, object> { { "email", username } });
 
             if (response.IsSuccessful)
             {
@@ -117,30 +122,32 @@ namespace PasswordManagerAccess.Bitwarden
         {
             switch (info.Kdf)
             {
-            case R.KdfMethod.Pbkdf2Sha256:
-                if (info.Iterations <= 0)
-                    throw new InternalErrorException($"Invalid iteration count: {info.Iterations}");
-                break;
-            case R.KdfMethod.Argon2id:
-                if (info.Iterations <= 0)
-                    throw new InternalErrorException($"Invalid iteration count: {info.Iterations}");
-                if (info.Memory <= 0)
-                    throw new InternalErrorException($"Invalid memory parameter: {info.Memory}");
-                if (info.Parallelism <= 0)
-                    throw new InternalErrorException($"Invalid parallelism parameter: {info.Parallelism}");
-                break;
-            default:
-                throw new UnsupportedFeatureException($"KDF method {info.Kdf} is not supported");
+                case R.KdfMethod.Pbkdf2Sha256:
+                    if (info.Iterations <= 0)
+                        throw new InternalErrorException($"Invalid iteration count: {info.Iterations}");
+                    break;
+                case R.KdfMethod.Argon2id:
+                    if (info.Iterations <= 0)
+                        throw new InternalErrorException($"Invalid iteration count: {info.Iterations}");
+                    if (info.Memory <= 0)
+                        throw new InternalErrorException($"Invalid memory parameter: {info.Memory}");
+                    if (info.Parallelism <= 0)
+                        throw new InternalErrorException($"Invalid parallelism parameter: {info.Parallelism}");
+                    break;
+                default:
+                    throw new UnsupportedFeatureException($"KDF method {info.Kdf} is not supported");
             }
         }
 
-        internal static string Login(string username,
-                                     byte[] passwordHash,
-                                     string deviceId,
-                                     IUi ui,
-                                     ISecureStorage storage,
-                                     RestClient apiRest,
-                                     RestClient identityRest)
+        internal static string Login(
+            string username,
+            byte[] passwordHash,
+            string deviceId,
+            IUi ui,
+            ISecureStorage storage,
+            RestClient apiRest,
+            RestClient identityRest
+        )
         {
             // Try simple password login, potentially with a stored second factor token if
             // "remember me" was used before.
@@ -165,38 +172,54 @@ namespace PasswordManagerAccess.Bitwarden
 
             switch (method)
             {
-            case R.SecondFactorMethod.GoogleAuth:
-                passcode = ui.ProvideGoogleAuthPasscode();
-                break;
-            case R.SecondFactorMethod.Email:
-                // When only the email 2FA present, the email is sent by the server right away.
-                // Trigger only when other methods are present.
-                if (secondFactor.Methods.Count != 1)
-                    TriggerEmailMfaPasscode(username, passwordHash, apiRest);
+                case R.SecondFactorMethod.GoogleAuth:
+                    passcode = ui.ProvideGoogleAuthPasscode();
+                    break;
+                case R.SecondFactorMethod.Email:
+                    // When only the email 2FA present, the email is sent by the server right away.
+                    // Trigger only when other methods are present.
+                    if (secondFactor.Methods.Count != 1)
+                        TriggerEmailMfaPasscode(username, passwordHash, apiRest);
 
-                passcode = ui.ProvideEmailPasscode((string)extra["Email"] ?? "");
-                break;
-            case R.SecondFactorMethod.Duo:
-            case R.SecondFactorMethod.DuoOrg:
-            {
-                var duo = DuoV1.Authenticate((string)extra["Host"] ?? "",
-                                             (string)extra["Signature"] ?? "",
-                                             ui,
-                                             apiRest.Transport);
+                    passcode = ui.ProvideEmailPasscode((string)extra["Email"] ?? "");
+                    break;
+                case R.SecondFactorMethod.Duo:
+                case R.SecondFactorMethod.DuoOrg:
+                {
+                    // TODO: The logic here is a bit brittle. Remove it once Duo V1 is finally removed in October 2024.
 
-                if (duo != null)
-                    passcode = new Passcode(duo.Passcode, duo.RememberMe);
+                    // It's a bit messy here. Normally when AuthUrl is present that means we should use V4.
+                    // The problem with V4 that it could redirect to the traditional prompt with is handled by V1.
+                    // So we try V4 first and if it redirects to V1 we try V1.
+                    var needV1 = !extra.ContainsKey("AuthUrl");
 
-                break;
-            }
-            case R.SecondFactorMethod.YubiKey:
-                passcode = ui.ProvideYubiKeyPasscode();
-                break;
-            case R.SecondFactorMethod.U2f:
-                passcode = AskU2fPasscode(JObject.Parse((string)extra["Challenge"]), ui);
-                break;
-            default:
-                throw new UnsupportedFeatureException($"2FA method {method} is not supported");
+                    if (!needV1)
+                    {
+                        var v4 = DuoV4.Authenticate((string)extra["AuthUrl"], ui, apiRest.Transport);
+
+                        if (v4 == Result.RedirectToV1)
+                            needV1 = true; // Fallback to V1 below
+                        else if (v4 != null)
+                            passcode = new Passcode($"{v4.Code}|{v4.State}", v4.RememberMe);
+                    }
+
+                    if (needV1)
+                    {
+                        var v1 = DuoV1.Authenticate((string)extra["Host"] ?? "", (string)extra["Signature"] ?? "", ui, apiRest.Transport);
+                        if (v1 != null)
+                            passcode = new Passcode(v1.Code, v1.RememberMe);
+                    }
+
+                    break;
+                }
+                case R.SecondFactorMethod.YubiKey:
+                    passcode = ui.ProvideYubiKeyPasscode();
+                    break;
+                case R.SecondFactorMethod.U2f:
+                    passcode = AskU2fPasscode(JObject.Parse((string)extra["Challenge"]), ui);
+                    break;
+                default:
+                    throw new UnsupportedFeatureException($"2FA method {method} is not supported");
             }
 
             // We're done interacting with the UI
@@ -205,13 +228,13 @@ namespace PasswordManagerAccess.Bitwarden
             if (passcode == null)
                 throw MakeCancelledMfaError();
 
-            var secondFactorResponse = RequestAuthToken(username,
-                                                        passwordHash,
-                                                        deviceId,
-                                                        new SecondFactorOptions(method,
-                                                                                passcode.Code,
-                                                                                passcode.RememberMe),
-                                                        identityRest);
+            var secondFactorResponse = RequestAuthToken(
+                username,
+                passwordHash,
+                deviceId,
+                new SecondFactorOptions(method, passcode.Code, passcode.RememberMe),
+                identityRest
+            );
 
             // Password + 2FA is successful
             if (secondFactorResponse.AuthToken != null)
@@ -223,10 +246,7 @@ namespace PasswordManagerAccess.Bitwarden
             throw new BadMultiFactorException("Second factor code is not correct");
         }
 
-        internal static (string Token, R.KdfInfo KdfInfo) LoginCliApi(string clientId,
-                                                                      string clientSecret,
-                                                                      string deviceId,
-                                                                      RestClient rest)
+        internal static (string Token, R.KdfInfo KdfInfo) LoginCliApi(string clientId, string clientSecret, string deviceId, RestClient rest)
         {
             var parameters = new Dictionary<string, object>
             {
@@ -235,7 +255,7 @@ namespace PasswordManagerAccess.Bitwarden
                 { "grant_type", "client_credentials" },
                 { "scope", "api" },
                 { "deviceType", DeviceType },
-                { "deviceName", DeviceName },
+                { "deviceName", Platform },
                 { "deviceIdentifier", deviceId },
             };
 
@@ -298,12 +318,14 @@ namespace PasswordManagerAccess.Bitwarden
             }
 
             // This is the 2FA token that is expected by the BW server
-            var token = JsonConvert.SerializeObject(new
-            {
-                keyHandle = assertion.KeyHandle,
-                clientData = assertion.ClientData,
-                signatureData = assertion.Signature,
-            });
+            var token = JsonConvert.SerializeObject(
+                new
+                {
+                    keyHandle = assertion.KeyHandle,
+                    clientData = assertion.ClientData,
+                    signatureData = assertion.Signature,
+                }
+            );
 
             // TODO: Add support for remember-me.
             return new Passcode(token, false);
@@ -320,27 +342,27 @@ namespace PasswordManagerAccess.Bitwarden
             {
                 switch (m)
                 {
-                case R.SecondFactorMethod.GoogleAuth:
-                    availableMethods.Add(MfaMethod.GoogleAuth);
-                    break;
-                case R.SecondFactorMethod.Email:
-                    availableMethods.Add(MfaMethod.Email);
-                    break;
-                case R.SecondFactorMethod.Duo:
-                    availableMethods.Add(MfaMethod.Duo);
-                    break;
-                case R.SecondFactorMethod.YubiKey:
-                    availableMethods.Add(MfaMethod.YubiKey);
-                    break;
-                case R.SecondFactorMethod.U2f:
-                    if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-                        availableMethods.Add(MfaMethod.U2f);
-                    break;
-                case R.SecondFactorMethod.RememberMe:
-                    break;
-                case R.SecondFactorMethod.DuoOrg:
-                    availableMethods.Add(MfaMethod.DuoOrg);
-                    break;
+                    case R.SecondFactorMethod.GoogleAuth:
+                        availableMethods.Add(MfaMethod.GoogleAuth);
+                        break;
+                    case R.SecondFactorMethod.Email:
+                        availableMethods.Add(MfaMethod.Email);
+                        break;
+                    case R.SecondFactorMethod.Duo:
+                        availableMethods.Add(MfaMethod.Duo);
+                        break;
+                    case R.SecondFactorMethod.YubiKey:
+                        availableMethods.Add(MfaMethod.YubiKey);
+                        break;
+                    case R.SecondFactorMethod.U2f:
+                        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                            availableMethods.Add(MfaMethod.U2f);
+                        break;
+                    case R.SecondFactorMethod.RememberMe:
+                        break;
+                    case R.SecondFactorMethod.DuoOrg:
+                        availableMethods.Add(MfaMethod.DuoOrg);
+                        break;
                 }
             }
 
@@ -363,7 +385,7 @@ namespace PasswordManagerAccess.Bitwarden
                 MfaMethod.YubiKey => R.SecondFactorMethod.YubiKey,
                 MfaMethod.U2f => R.SecondFactorMethod.U2f,
                 MfaMethod.DuoOrg => R.SecondFactorMethod.DuoOrg,
-                _ => throw new InternalErrorException("The user responded with invalid input")
+                _ => throw new InternalErrorException("The user responded with invalid input"),
             };
         }
 
@@ -402,31 +424,30 @@ namespace PasswordManagerAccess.Bitwarden
             }
         }
 
-        internal static TokenOrSecondFactor RequestAuthToken(string username,
-                                                             byte[] passwordHash,
-                                                             string deviceId,
-                                                             RestClient rest)
+        internal static TokenOrSecondFactor RequestAuthToken(string username, byte[] passwordHash, string deviceId, RestClient rest)
         {
             return RequestAuthToken(username, passwordHash, deviceId, null, rest);
         }
 
         // secondFactorOptions is optional
-        internal static TokenOrSecondFactor RequestAuthToken(string username,
-                                                             byte[] passwordHash,
-                                                             string deviceId,
-                                                             SecondFactorOptions secondFactorOptions,
-                                                             RestClient rest)
+        internal static TokenOrSecondFactor RequestAuthToken(
+            string username,
+            byte[] passwordHash,
+            string deviceId,
+            SecondFactorOptions secondFactorOptions,
+            RestClient rest
+        )
         {
             var parameters = new Dictionary<string, object>
             {
-                {"username", username},
-                {"password", passwordHash.ToBase64()},
-                {"grant_type", "password"},
-                {"scope", "api offline_access"},
-                {"client_id", "cli"},
-                {"deviceType", DeviceType},
-                {"deviceName", DeviceName},
-                {"deviceIdentifier", deviceId},
+                { "username", username },
+                { "password", passwordHash.ToBase64() },
+                { "grant_type", "password" },
+                { "scope", "api offline_access" },
+                { "client_id", "cli" },
+                { "deviceType", DeviceType },
+                { "deviceName", Platform },
+                { "deviceIdentifier", deviceId },
             };
 
             if (secondFactorOptions != null)
@@ -436,10 +457,7 @@ namespace PasswordManagerAccess.Bitwarden
                 parameters["twoFactorRemember"] = secondFactorOptions.RememberMe ? "1" : "0";
             }
 
-            var headers = new Dictionary<string, string>
-            {
-                ["Auth-Email"] = username.ToBytes().ToUrlSafeBase64NoPadding(),
-            };
+            var headers = new Dictionary<string, string> { ["Auth-Email"] = username.ToBytes().ToUrlSafeBase64NoPadding() };
 
             var response = rest.PostForm<R.AuthToken>("connect/token", parameters, headers);
             if (response.IsSuccessful)
@@ -477,11 +495,7 @@ namespace PasswordManagerAccess.Bitwarden
 
         internal static void TriggerEmailMfaPasscode(string username, byte[] passwordHash, RestClient rest)
         {
-            var parameters = new Dictionary<string, object>
-            {
-                {"email", username},
-                {"masterPasswordHash", passwordHash.ToBase64()},
-            };
+            var parameters = new Dictionary<string, object> { { "email", username }, { "masterPasswordHash", passwordHash.ToBase64() } };
 
             var response = rest.PostJson("two-factor/send-email-login", parameters);
             if (response.IsSuccessful)
@@ -492,8 +506,7 @@ namespace PasswordManagerAccess.Bitwarden
 
         internal static R.Vault DownloadVault(RestClient rest, string token)
         {
-            var response = rest.Get<R.Vault>("sync?excludeDomains=true",
-                                             new Dictionary<string, string> {{"Authorization", token}});
+            var response = rest.Get<R.Vault>("sync?excludeDomains=true", new Dictionary<string, string> { { "Authorization", token } });
             if (response.IsSuccessful)
                 return response.Data;
 
@@ -552,22 +565,25 @@ namespace PasswordManagerAccess.Bitwarden
             return folders.ToDictionary(i => i.Id, i => DecryptToString(i.Name, key));
         }
 
-        internal static Collection[] ParseCollections(R.Collection[] collections,
-                                                      byte[] vaultKey,
-                                                      Dictionary<string, byte[]> orgKeys)
+        internal static Collection[] ParseCollections(R.Collection[] collections, byte[] vaultKey, Dictionary<string, byte[]> orgKeys)
         {
-            return collections.Select(x => new Collection(
-                id: x.Id,
-                name: DecryptToString(x.Name, x.OrganizationId.IsNullOrEmpty() ? vaultKey : orgKeys[x.OrganizationId]),
-                organizationId: x.OrganizationId ?? "",
-                hidePasswords: x.HidePasswords)).ToArray();
+            return collections
+                .Select(x => new Collection(
+                    id: x.Id,
+                    name: DecryptToString(x.Name, x.OrganizationId.IsNullOrEmpty() ? vaultKey : orgKeys[x.OrganizationId]),
+                    organizationId: x.OrganizationId ?? "",
+                    hidePasswords: x.HidePasswords
+                ))
+                .ToArray();
         }
 
-        internal static (Account[], ParseError[]) ParseAccounts(R.Item[] items,
-                                                                byte[] vaultKey,
-                                                                Dictionary<string, byte[]> orgKeys,
-                                                                Dictionary<string, string> folders,
-                                                                Dictionary<string,Collection> collections)
+        internal static (Account[], ParseError[]) ParseAccounts(
+            R.Item[] items,
+            byte[] vaultKey,
+            Dictionary<string, byte[]> orgKeys,
+            Dictionary<string, string> folders,
+            Dictionary<string, Collection> collections
+        )
         {
             var accounts = new List<Account>(items.Length);
             List<ParseError> errors = null;
@@ -591,35 +607,69 @@ namespace PasswordManagerAccess.Bitwarden
             return (accounts.ToArray(), errors?.ToArray() ?? Array.Empty<ParseError>());
         }
 
-        internal static Account ParseAccountItem(R.Item item,
-                                                 byte[] vaultKey,
-                                                 Dictionary<string, byte[]> orgKeys,
-                                                 Dictionary<string, string> folders,
-                                                 Dictionary<string, Collection> collections)
+        internal static Account ParseAccountItem(
+            R.Item item,
+            byte[] vaultKey,
+            Dictionary<string, byte[]> orgKeys,
+            Dictionary<string, string> folders,
+            Dictionary<string, Collection> collections
+        )
         {
-            var key = item.OrganizationId.IsNullOrEmpty()
-                ? vaultKey
-                : orgKeys[item.OrganizationId];
+            // The item is encrypted with either the vault key or the org key.
+            var key = item.OrganizationId.IsNullOrEmpty() ? vaultKey : orgKeys[item.OrganizationId];
 
-            var folder = item.FolderId != null && folders.ContainsKey(item.FolderId)
-                ? folders[item.FolderId]
-                : "";
+            // Newer items (from approx. Aug 2024) have a unique item key attached.
+            if (!item.Key.IsNullOrEmpty())
+                key = DecryptToBytes(item.Key, key);
 
-            return new Account(id: item.Id,
-                               name: DecryptToStringOrBlank(item.Name, key),
-                               username: DecryptToStringOrBlank(item.Login.Username, key),
-                               password: DecryptToStringOrBlank(item.Login.Password, key),
-                               url: DecryptToStringOrBlank(item.Login.Uri, key),
-                               note: DecryptToStringOrBlank(item.Notes, key),
-                               totp: DecryptToStringOrBlank(item.Login.Totp, key),
-                               deletedDate: item.DeletedDate,
-                               folder: folder,
-                               collectionIds: item.CollectionIds ?? Array.Empty<string>(),
-                               hidePassword: ResolveHidePassword(item.CollectionIds, collections));
+            var folder = item.FolderId != null && folders.ContainsKey(item.FolderId) ? folders[item.FolderId] : "";
+
+            return new Account(
+                id: item.Id,
+                name: DecryptToStringOrBlank(item.Name, key),
+                username: DecryptToStringOrBlank(item.Login.Username, key),
+                password: DecryptToStringOrBlank(item.Login.Password, key),
+                url: DecryptToStringOrBlank(item.Login.Uri, key),
+                note: DecryptToStringOrBlank(item.Notes, key),
+                totp: DecryptToStringOrBlank(item.Login.Totp, key),
+                deletedDate: item.DeletedDate,
+                folder: folder,
+                collectionIds: item.CollectionIds ?? [],
+                hidePassword: ResolveHidePassword(item.CollectionIds, collections),
+                customFields: ParseCustomFields(item, key)
+            );
         }
 
-        internal static bool ResolveHidePassword(string[] collectionIds,
-                                                 Dictionary<string, Collection> collections)
+        internal static CustomField[] ParseCustomFields(R.Item item, byte[] key)
+        {
+            return item.Fields?.Select(x => ParseField(x, key, item)).ToArray() ?? [];
+        }
+
+        internal static CustomField ParseField(R.Field field, byte[] key, R.Item item)
+        {
+            var name = DecryptToStringOrBlank(field.Name, key);
+            var value = DecryptToStringOrBlank(field.Value, key);
+
+            return field.Type switch
+            {
+                0 or 1 or 2 => new CustomField(name, value),
+                3 => new CustomField(name, ResolveLinkedField(field.LinkedId, key, item)),
+                _ => throw new UnsupportedFeatureException($"Custom field type {field.Type} is not supported"),
+            };
+        }
+
+        internal static string ResolveLinkedField(int? fieldLinkedId, byte[] key, R.Item item)
+        {
+            return fieldLinkedId switch
+            {
+                null => "",
+                100 => DecryptToStringOrBlank(item.Login.Username, key),
+                101 => DecryptToStringOrBlank(item.Login.Password, key),
+                _ => throw new UnsupportedFeatureException($"Linked field ID {fieldLinkedId} is not supported"),
+            };
+        }
+
+        internal static bool ResolveHidePassword(string[] collectionIds, Dictionary<string, Collection> collections)
         {
             // Items that don't have any collections associated with them cannot hide their password.
             if (collectionIds.Length == 0)
@@ -644,7 +694,7 @@ namespace PasswordManagerAccess.Bitwarden
 
         internal static string DecryptToString(string s, byte[] key)
         {
-            return  DecryptToBytes(s, key).ToUtf8();
+            return DecryptToBytes(s, key).ToUtf8();
         }
 
         // s may be null
@@ -684,11 +734,7 @@ namespace PasswordManagerAccess.Bitwarden
             }
 
             var e = error.Value;
-            var message = e.Info.Message ??
-                          e.Description ??
-                          e.Message ??
-                          e.Id ??
-                          "unknown error";
+            var message = e.Info.Message ?? e.Description ?? e.Message ?? e.Id ?? "unknown error";
 
             if (message.Contains("Username or password is incorrect"))
                 return new BadCredentialsException(message);
@@ -745,32 +791,26 @@ namespace PasswordManagerAccess.Bitwarden
 
         private const string RememberMeTokenKey = "remember-me-token";
 
-        private static readonly string DeviceName = GetPlatform();
-        private static readonly string DeviceType = DeviceName switch
+        private const string CliVersion = "2024.4.1";
+        private static readonly string Platform = GetPlatform();
+        private static readonly string UserAgent = $"Bitwarden_CLI/{CliVersion} ({Platform.ToUpper()})";
+
+        private static readonly string DeviceType = Platform switch
         {
-            "windows" => "6",
-            "macos" => "7",
-            "linux" => "8",
-            _ => throw new InternalErrorException($"Unexpected device name {DeviceName}")
-        };
-        private static readonly string UserAgent = DeviceName switch
-        {
-            "windows" => "Bitwarden_CLI/[object Promise] (WINDOWS)",
-            "macos" => "Bitwarden_CLI/[object Promise] (MACOS)",
-            "linux" => "Bitwarden_CLI/2023.1.0 (LINUX)",
-            _ => throw new InternalErrorException($"Unexpected device name {DeviceName}")
+            "windows" => "23",
+            "macos" => "24",
+            "linux" => "25",
+            _ => throw new InternalErrorException($"Unexpected device name {Platform}"),
         };
 
         private static readonly Dictionary<string, string> DefaultRestHeaders = new Dictionary<string, string>
         {
             ["User-Agent"] = UserAgent,
             ["Device-Type"] = DeviceType,
+            ["Bitwarden-Client-Name"] = "cli",
+            ["Bitwarden-Client-Version"] = CliVersion,
         };
 
-        private static readonly R.KdfInfo DefaultKdfInfo = new R.KdfInfo
-        {
-            Kdf = R.KdfMethod.Pbkdf2Sha256,
-            Iterations = 5000
-        };
+        private static readonly R.KdfInfo DefaultKdfInfo = new R.KdfInfo { Kdf = R.KdfMethod.Pbkdf2Sha256, Iterations = 5000 };
     }
 }

@@ -16,29 +16,67 @@ namespace PasswordManagerAccess.LastPass
 {
     internal static class Client
     {
-        public static Account[] OpenVault(string username,
-                                          string password,
-                                          ClientInfo clientInfo,
-                                          IUi ui,
-                                          IRestTransport transport,
-                                          ParserOptions options)
+        public static Account[] OpenVault(
+            string username,
+            string password,
+            ClientInfo clientInfo,
+            IUi ui,
+            IRestTransport transport,
+            ParserOptions options,
+            ISecureLogger logger // can be null
+        )
         {
-            var lowerCaseUsername = username.ToLowerInvariant();
-            var (session, rest) = Login(lowerCaseUsername, password, clientInfo, ui, transport);
+            // We allow the logger to be null for optimization purposes
+            var tagLog = options.LoggingEnabled ? new TaggedLogger("LastPass", logger ?? new NullLogger()) : null;
+
+            // Add filters to the log
+            if (tagLog != null)
+            {
+                tagLog.AddFilter(username);
+                tagLog.AddFilter(username.EncodeUri());
+                tagLog.AddFilter(username.EncodeUriData());
+                tagLog.AddFilter(password);
+                tagLog.AddFilter(password.EncodeUri());
+                tagLog.AddFilter(password.EncodeUriData());
+                tagLog.AddFilter(clientInfo.Id);
+                tagLog.AddRegexFilter(@"(?<=hash=)[a-z0-9]+");
+                tagLog.AddRegexFilter(@"(?<=PHPSESSID=)[a-z0-9]+");
+                tagLog.AddRegexFilter(@"(?<=sessionid=)"".*?""");
+
+                // TODO: Move to Duo
+                tagLog.AddRegexFilter(@"(?<=duo_(session|private)_token=)"".*?""");
+                tagLog.AddRegexFilter(@"(?<=Cookie: sid\|)[a-z0-9-]="".*?""");
+                tagLog.AddRegexFilter(@"(?<=\bsid=)[a-z0-9%-]+");
+                tagLog.AddRegexFilter(@"(?<=TX\|)[a-z0-9|:-]+");
+                tagLog.AddRegexFilter(@"(?<=eyJ0eXAiOiJKV1QiL.*?\.)[a-z0-9.%_/+-]+"); // JWT tokens
+            }
+
             try
             {
-                var blob = DownloadVault(session, rest);
-                var key = Util.DeriveKey(lowerCaseUsername, password, session.KeyIterationCount);
+                var lowerCaseUsername = username.ToLowerInvariant();
+                var (session, rest) = Login(lowerCaseUsername, password, clientInfo, ui, transport, tagLog);
+                try
+                {
+                    var blob = DownloadVault(session, rest);
+                    var key = Util.DeriveKey(lowerCaseUsername, password, session.KeyIterationCount);
 
-                var privateKey = new RSAParameters();
-                if (!session.EncryptedPrivateKey.IsNullOrEmpty())
-                    privateKey = Parser.ParseEncryptedPrivateKey(session.EncryptedPrivateKey, key);
+                    var privateKey = new RSAParameters();
+                    if (!session.EncryptedPrivateKey.IsNullOrEmpty())
+                        privateKey = Parser.ParseEncryptedPrivateKey(session.EncryptedPrivateKey, key);
 
-                return ParseVault(blob, key, privateKey, options);
+                    return ParseVault(blob, key, privateKey, options);
+                }
+                finally
+                {
+                    Logout(session, rest);
+                }
             }
-            finally
+            catch (BaseException e)
             {
-                Logout(session, rest);
+                if (tagLog != null)
+                    e.Log = tagLog.Entries;
+
+                throw;
             }
         }
 
@@ -46,13 +84,16 @@ namespace PasswordManagerAccess.LastPass
         // Internal
         //
 
-        internal static (Session, RestClient) Login(string username,
-                                                    string password,
-                                                    ClientInfo clientInfo,
-                                                    IUi ui,
-                                                    IRestTransport transport)
+        internal static (Session, RestClient) Login(
+            string username,
+            string password,
+            ClientInfo clientInfo,
+            IUi ui,
+            IRestTransport transport,
+            ISimpleLogger logger
+        )
         {
-            var rest = new RestClient(transport, "https://lastpass.com");
+            var rest = new RestClient(transport, "https://lastpass.com", logger: logger);
 
             // 1. First we need to request PBKDF2 key iteration count.
             //
@@ -75,12 +116,7 @@ namespace PasswordManagerAccess.LastPass
             {
                 // 2. Knowing the iterations count we can hash the password and log in.
                 //    On the first attempt simply with the username and password.
-                response = PerformSingleLoginRequest(username,
-                                                     password,
-                                                     keyIterationCount,
-                                                     new Dictionary<string, object>(),
-                                                     clientInfo,
-                                                     rest);
+                response = PerformSingleLoginRequest(username, password, keyIterationCount, new Dictionary<string, object>(), clientInfo, rest);
 
                 session = ExtractSessionFromLoginResponse(response, keyIterationCount, clientInfo);
                 if (session != null)
@@ -112,24 +148,11 @@ namespace PasswordManagerAccess.LastPass
 
             // 3.1. One-time-password is required
             if (KnownOtpMethods.TryGetValue(cause, out var otpMethod))
-                session = LoginWithOtp(username,
-                                       password,
-                                       keyIterationCount,
-                                       otpMethod,
-                                       clientInfo,
-                                       ui,
-                                       rest);
-
+                session = LoginWithOtp(username, password, keyIterationCount, otpMethod, clientInfo, ui, rest);
             // 3.2. Some out-of-bound authentication is enabled. This does not require any
             //      additional input from the user.
             else if (cause == "outofbandrequired")
-                session = LoginWithOob(username,
-                                       password,
-                                       keyIterationCount,
-                                       GetAllErrorAttributes(response),
-                                       clientInfo,
-                                       ui,
-                                       rest);
+                session = LoginWithOob(username, password, keyIterationCount, GetAllErrorAttributes(response), clientInfo, ui, rest, logger);
 
             // Nothing worked
             if (session == null)
@@ -139,12 +162,14 @@ namespace PasswordManagerAccess.LastPass
             return (session, rest);
         }
 
-        internal static XDocument PerformSingleLoginRequest(string username,
-                                                            string password,
-                                                            int keyIterationCount,
-                                                            Dictionary<string, object> extraParameters,
-                                                            ClientInfo clientInfo,
-                                                            RestClient rest)
+        internal static XDocument PerformSingleLoginRequest(
+            string username,
+            string password,
+            int keyIterationCount,
+            Dictionary<string, object> extraParameters,
+            ClientInfo clientInfo,
+            RestClient rest
+        )
         {
             var parameters = new Dictionary<string, object>
             {
@@ -177,31 +202,35 @@ namespace PasswordManagerAccess.LastPass
         }
 
         // Returns a valid session or throws
-        internal static Session LoginWithOtp(string username,
-                                             string password,
-                                             int keyIterationCount,
-                                             OtpMethod method,
-                                             ClientInfo clientInfo,
-                                             IUi ui,
-                                             RestClient rest)
+        internal static Session LoginWithOtp(
+            string username,
+            string password,
+            int keyIterationCount,
+            OtpMethod method,
+            ClientInfo clientInfo,
+            IUi ui,
+            RestClient rest
+        )
         {
             var passcode = method switch
             {
                 OtpMethod.GoogleAuth => ui.ProvideGoogleAuthPasscode(),
                 OtpMethod.MicrosoftAuth => ui.ProvideMicrosoftAuthPasscode(),
                 OtpMethod.Yubikey => ui.ProvideYubikeyPasscode(),
-                _ => throw new InternalErrorException("Invalid OTP method")
+                _ => throw new InternalErrorException("Invalid OTP method"),
             };
 
             if (passcode == OtpResult.Cancel)
                 throw new CanceledMultiFactorException("Second factor step is canceled by the user");
 
-            var response = PerformSingleLoginRequest(username,
-                                                     password,
-                                                     keyIterationCount,
-                                                     new Dictionary<string, object> {["otp"] = passcode.Passcode},
-                                                     clientInfo,
-                                                     rest);
+            var response = PerformSingleLoginRequest(
+                username,
+                password,
+                keyIterationCount,
+                new Dictionary<string, object> { ["otp"] = passcode.Passcode },
+                clientInfo,
+                rest
+            );
 
             var session = ExtractSessionFromLoginResponse(response, keyIterationCount, clientInfo);
             if (session == null)
@@ -214,36 +243,35 @@ namespace PasswordManagerAccess.LastPass
         }
 
         // Returns a valid session or throws
-        internal static Session LoginWithOob(string username,
-                                             string password,
-                                             int keyIterationCount,
-                                             Dictionary<string, string> parameters,
-                                             ClientInfo clientInfo,
-                                             IUi ui,
-                                             RestClient rest)
+        internal static Session LoginWithOob(
+            string username,
+            string password,
+            int keyIterationCount,
+            Dictionary<string, string> parameters,
+            ClientInfo clientInfo,
+            IUi ui,
+            RestClient rest,
+            ISimpleLogger logger
+        )
         {
-            var answer = ApproveOob(username, parameters, ui, rest);
+            var oob = ApproveOob(username, parameters, ui, rest, logger);
 
-            if (answer == OobResult.Cancel)
+            var result = oob.Result;
+            if (result == OobResult.Cancel)
                 throw new CanceledMultiFactorException("Out of band step is canceled by the user");
 
-            var extraParameters = new Dictionary<string, object>(1);
-            if (answer.WaitForOutOfBand)
+            var extraParameters = new Dictionary<string, object>(oob.Extras);
+            if (result.WaitForOutOfBand)
                 extraParameters["outofbandrequest"] = 1;
             else
-                extraParameters["otp"] = answer.Passcode;
+                extraParameters["otp"] = result.Passcode;
 
             Session session;
-            for (;;)
+            for (; ; )
             {
                 // In case of the OOB auth the server doesn't respond instantly. This works more like a long poll.
                 // The server times out in about 10 seconds so there's no need to back off.
-                var response = PerformSingleLoginRequest(username,
-                                                         password,
-                                                         keyIterationCount,
-                                                         extraParameters,
-                                                         clientInfo,
-                                                         rest);
+                var response = PerformSingleLoginRequest(username, password, keyIterationCount, extraParameters, clientInfo, rest);
 
                 session = ExtractSessionFromLoginResponse(response, keyIterationCount, clientInfo);
                 if (session != null)
@@ -257,43 +285,62 @@ namespace PasswordManagerAccess.LastPass
                 extraParameters["outofbandretryid"] = GetErrorAttribute(response, "retryid");
             }
 
-            if (answer.RememberMe)
+            if (result.RememberMe)
                 MarkDeviceAsTrusted(session, clientInfo, rest);
 
             return session;
         }
 
-        internal static OobResult ApproveOob(string username,
-                                             Dictionary<string, string> parameters,
-                                             IUi ui,
-                                             RestClient rest)
+        // This is used to pass the extra params along with the OOB result
+        internal struct OobWithExtras(OobResult result, Dictionary<string, object> extras = null)
+        {
+            // This is a special sentinel value to mark the Duo V4 to V1 redirect
+            public static readonly OobResult DuoV4ToV1Redirect = OobResult.ContinueWithPasscode("duo-v4-to-v1-redirect", false);
+
+            public readonly OobResult Result = result;
+            public readonly Dictionary<string, object> Extras = extras ?? new Dictionary<string, object>();
+        }
+
+        internal static OobWithExtras ApproveOob(
+            string username,
+            Dictionary<string, string> parameters,
+            IUi ui,
+            RestClient rest,
+            ISimpleLogger logger
+        )
         {
             if (!parameters.TryGetValue("outofbandtype", out var method))
                 throw new InternalErrorException("Out of band method is not specified");
 
             return method switch
             {
-                "lastpassauth" => ui.ApproveLastPassAuth(),
-                "duo" => ApproveDuo(username, parameters, ui, rest),
-                "salesforcehash" => ui.ApproveSalesforceAuth(),
-                _ => throw new UnsupportedFeatureException($"Out of band method '{method}' is not supported")
+                "lastpassauth" => new OobWithExtras(ui.ApproveLastPassAuth()),
+                "duo" => ApproveDuo(username, parameters, ui, rest, logger),
+                "salesforcehash" => new OobWithExtras(ui.ApproveSalesforceAuth()),
+                _ => throw new UnsupportedFeatureException($"Out of band method '{method}' is not supported"),
             };
         }
 
-        internal static OobResult ApproveDuo(string username,
-                                             Dictionary<string, string> parameters,
-                                             IUi ui,
-                                             RestClient rest)
+        internal static OobWithExtras ApproveDuo(
+            string username,
+            Dictionary<string, string> parameters,
+            IUi ui,
+            RestClient rest,
+            ISimpleLogger logger
+        )
         {
             return parameters.GetOrDefault("preferduowebsdk", "") == "1"
-                ? ApproveDuoWebSdk(username, parameters, ui, rest)
-                : ui.ApproveDuo();
+                ? ApproveDuoWebSdk(username, parameters, ui, rest, logger)
+                : new OobWithExtras(ui.ApproveDuo());
         }
 
-        internal static OobResult ApproveDuoWebSdk(string username,
-                                                   Dictionary<string, string> parameters,
-                                                   IUi ui,
-                                                   RestClient rest)
+        internal static OobWithExtras ApproveDuoWebSdk(
+            string username,
+            Dictionary<string, string> parameters,
+            IUi ui,
+            RestClient rest,
+            ISimpleLogger logger
+        )
         {
             string GetParam(string name)
             {
@@ -303,26 +350,117 @@ namespace PasswordManagerAccess.LastPass
                 throw new InternalErrorException($"Invalid response: '{name}' parameter not found");
             }
 
-            var host = GetParam("duo_host");
-            var signature = GetParam("duo_signature");
-            var salt = GetParam("duo_bytes");
+            // See if V4 is enabled
+            if (parameters.TryGetValue("duo_authentication_url", out var url))
+            {
+                var result = ApproveDuoWebSdkV4(
+                    username: username,
+                    url: url,
+                    sessionToken: GetParam("duo_session_token"),
+                    privateToken: GetParam("duo_private_token"),
+                    ui: ui,
+                    rest: rest,
+                    logger: logger
+                );
 
-            // Returns: AUTH|ZGV...Tcx|545...07b:APP|ZGV...TAx|145...09e
-            var result = DuoV1.Authenticate(host, signature, ui, rest.Transport);
-            if (result == null)
-                return OobResult.Cancel;
+                // If we're not redirected to V1, we're done. Otherwise, fallthrough to V1.
+                if (result.Result != OobWithExtras.DuoV4ToV1Redirect)
+                    return result;
+            }
 
-            var passcode = ExchangeDuoSignatureForPasscode(username: username,
-                                                           signature: result.Passcode,
-                                                           salt: salt,
-                                                           rest: rest);
-            return OobResult.ContinueWithPasscode(passcode, result.RememberMe);
+            // Legacy Duo V1. Won't be available after September 2024.
+            return ApproveDuoWebSdkV1(
+                username: username,
+                host: GetParam("duo_host"),
+                salt: GetParam("duo_bytes"),
+                signature: GetParam("duo_signature"),
+                ui: ui,
+                rest: rest,
+                logger: logger
+            );
         }
 
-        internal static string ExchangeDuoSignatureForPasscode(string username,
-                                                               string signature,
-                                                               string salt,
-                                                               RestClient rest)
+        private static OobWithExtras ApproveDuoWebSdkV1(
+            string username,
+            string host,
+            string salt,
+            string signature,
+            IUi ui,
+            RestClient rest,
+            ISimpleLogger logger
+        )
+        {
+            // 1. Do a normal Duo V1 first
+            // Allow the logger to be null for optimization purposes (saved a bunch of work in the RestClient code)
+            // Allow the logger to be null for optimization purposes (saved a bunch of work in the RestClient code)
+            var duoLogger = logger == null ? null : new TaggedLogger("LastPass.DuoV1", logger);
+            var result = DuoV1.Authenticate(host, signature, ui, rest.Transport, duoLogger);
+            if (result == null)
+                return new OobWithExtras(OobResult.Cancel);
+
+            // 2. Exchange the signature for a passcode
+            var passcode = ExchangeDuoSignatureForPasscode(username: username, signature: result.Code, salt: salt, rest: rest);
+
+            return new OobWithExtras(OobResult.ContinueWithPasscode(passcode, result.RememberMe));
+        }
+
+        private static OobWithExtras ApproveDuoWebSdkV4(
+            string username,
+            string url,
+            string sessionToken,
+            string privateToken,
+            IUi ui,
+            RestClient rest,
+            ISimpleLogger logger
+        )
+        {
+            // 1. Do a normal Duo V4 first
+            // Allow the logger to be null for optimization purposes (saved a bunch of work in the RestClient code)
+            var duoLogger = logger == null ? null : new TaggedLogger("LastPass.DuoV4", logger);
+            var result = DuoV4.Authenticate(url, ui, rest.Transport, duoLogger);
+            if (result == null)
+                return new OobWithExtras(OobResult.Cancel);
+
+            // 2. Detect if we need to redirect to V1. This happens when the traditional prompt is enabled in the Duo
+            //    admin panel. The Duo URL looks the same for both the traditional prompt and the new universal one.
+            //    So we have no way of knowing this in advance. This only becomes evident after the first request to
+            //    the Duo API.
+            if (result == Result.RedirectToV1)
+                return new OobWithExtras(OobWithExtras.DuoV4ToV1Redirect);
+
+            // 3. Since LastPass is special we have to jump through some hoops to get this finalized
+            //    Even though Duo already returned us the code, we need to poll LastPass to get a
+            //    custom one-time token to submit it with the login request later.
+            var lmiRest = new RestClient(rest.Transport, "https://lastpass.com/lmiapi/duo");
+            var response = lmiRest.PostJson<Model.DuoStatus>(
+                "status",
+                new Dictionary<string, object>
+                {
+                    ["userName"] = username,
+                    ["sessionToken"] = sessionToken,
+                    ["privateToken"] = privateToken,
+                }
+            );
+            if (!response.IsSuccessful)
+                throw MakeError(response);
+
+            var status = response.Data;
+            if (status.Status == "allowed" && !status.OneTimeToken.IsNullOrEmpty())
+                return new OobWithExtras(
+                    OobResult.ContinueWithPasscode("duoWebSdkV4", result.RememberMe),
+                    new Dictionary<string, object>
+                    {
+                        ["provider"] = "duo",
+                        ["duoOneTimeToken"] = status.OneTimeToken,
+                        ["duoSessionToken"] = sessionToken,
+                        ["duoPrivateToken"] = privateToken,
+                    }
+                );
+
+            throw new InternalErrorException("Failed to retrieve Duo one time token");
+        }
+
+        internal static string ExchangeDuoSignatureForPasscode(string username, string signature, string salt, RestClient rest)
         {
             var parameters = new Dictionary<string, object>
             {
@@ -354,14 +492,16 @@ namespace PasswordManagerAccess.LastPass
 
         internal static void MarkDeviceAsTrusted(Session session, ClientInfo clientInfo, RestClient rest)
         {
-            var response = rest.PostForm("trust.php",
-                                         new Dictionary<string, object>
-                                         {
-                                             ["uuid"] = clientInfo.Id,
-                                             ["trustlabel"] = clientInfo.Description,
-                                             ["token"] = session.Token,
-                                         },
-                                         cookies: GetSessionCookies(session));
+            var response = rest.PostForm(
+                "trust.php",
+                new Dictionary<string, object>
+                {
+                    ["uuid"] = clientInfo.Id,
+                    ["trustlabel"] = clientInfo.Description,
+                    ["token"] = session.Token,
+                },
+                cookies: GetSessionCookies(session)
+            );
             if (response.IsSuccessful)
                 return;
 
@@ -370,13 +510,11 @@ namespace PasswordManagerAccess.LastPass
 
         internal static void Logout(Session session, RestClient rest)
         {
-            var response = rest.PostForm("logout.php",
-                                         new Dictionary<string, object>
-                                         {
-                                             ["method"] = PlatformToUserAgent[session.Platform],
-                                             ["noredirect"] = 1,
-                                         },
-                                         cookies: GetSessionCookies(session));
+            var response = rest.PostForm(
+                "logout.php",
+                new Dictionary<string, object> { ["method"] = PlatformToUserAgent[session.Platform], ["noredirect"] = 1 },
+                cookies: GetSessionCookies(session)
+            );
 
             if (response.IsSuccessful)
                 return;
@@ -400,7 +538,7 @@ namespace PasswordManagerAccess.LastPass
 
         internal static Dictionary<string, string> GetSessionCookies(Session session)
         {
-            return new Dictionary<string, string> {["PHPSESSID"] = Uri.EscapeDataString(session.Id)};
+            return new Dictionary<string, string> { ["PHPSESSID"] = Uri.EscapeDataString(session.Id) };
         }
 
         internal static XDocument ParseXml(RestResponse<string> response)
@@ -415,9 +553,7 @@ namespace PasswordManagerAccess.LastPass
             }
         }
 
-        internal static Session ExtractSessionFromLoginResponse(XDocument response,
-                                                                int keyIterationCount,
-                                                                ClientInfo clientInfo)
+        internal static Session ExtractSessionFromLoginResponse(XDocument response, int keyIterationCount, ClientInfo clientInfo)
         {
             var ok = response.XPathSelectElement("response/ok");
             if (ok == null)
@@ -431,11 +567,7 @@ namespace PasswordManagerAccess.LastPass
             if (token == null)
                 return null;
 
-            return new Session(sessionId.Value,
-                               keyIterationCount,
-                               token.Value,
-                               clientInfo.Platform,
-                               GetEncryptedPrivateKey(ok));
+            return new Session(sessionId.Value, keyIterationCount, token.Value, clientInfo.Platform, GetEncryptedPrivateKey(ok));
         }
 
         internal static string GetEncryptedPrivateKey(XElement ok)
@@ -461,44 +593,32 @@ namespace PasswordManagerAccess.LastPass
 
         internal static string GetOptionalErrorAttribute(XDocument response, string name)
         {
-            return response
-                .XPathSelectElement("response/error")?
-                .Attribute(name)?
-                .Value;
+            return response.XPathSelectElement("response/error")?.Attribute(name)?.Value;
         }
 
         internal static Dictionary<string, string> GetAllErrorAttributes(XDocument response)
         {
-            return response
-                .XPathSelectElement("response/error")?
-                .Attributes()
-                .ToDictionary(x => x.Name.LocalName, x => x.Value);
+            return response.XPathSelectElement("response/error")?.Attributes().ToDictionary(x => x.Name.LocalName, x => x.Value);
         }
 
         internal static Account[] ParseVault(byte[] blob, byte[] encryptionKey, RSAParameters privateKey, ParserOptions options)
         {
-            return blob.Open(
-                reader =>
-                {
-                    var chunks = Parser.ExtractChunks(reader);
-                    if (!IsComplete(chunks))
-                        throw new InternalErrorException("Blob is truncated or corrupted");
+            return blob.Open(reader =>
+            {
+                var chunks = Parser.ExtractChunks(reader);
+                if (!IsComplete(chunks))
+                    throw new InternalErrorException("Blob is truncated or corrupted");
 
-                    return ParseAccounts(chunks, encryptionKey, privateKey, options);
-                });
+                return ParseAccounts(chunks, encryptionKey, privateKey, options);
+            });
         }
 
         internal static bool IsComplete(List<Parser.Chunk> chunks)
         {
-            return chunks.Count > 0 &&
-                   chunks.Last().Id == "ENDM" &&
-                   chunks.Last().Payload.SequenceEqual("OK".ToBytes());
+            return chunks.Count > 0 && chunks.Last().Id == "ENDM" && chunks.Last().Payload.SequenceEqual("OK".ToBytes());
         }
 
-        internal static Account[] ParseAccounts(List<Parser.Chunk> chunks,
-                                                byte[] encryptionKey,
-                                                RSAParameters privateKey,
-                                                ParserOptions options)
+        internal static Account[] ParseAccounts(List<Parser.Chunk> chunks, byte[] encryptionKey, RSAParameters privateKey, ParserOptions options)
         {
             var accounts = new List<Account>(chunks.Count(i => i.Id == "ACCT"));
             SharedFolder folder = null;
@@ -507,18 +627,15 @@ namespace PasswordManagerAccess.LastPass
             {
                 switch (chunk.Id)
                 {
-                case "ACCT":
-                    var account = Parser.Parse_ACCT(chunk,
-                                                    folder == null ? encryptionKey : folder.EncryptionKey,
-                                                    folder,
-                                                    options);
+                    case "ACCT":
+                        var account = Parser.Parse_ACCT(chunk, folder == null ? encryptionKey : folder.EncryptionKey, folder, options);
 
-                    if (account != null)
-                        accounts.Add(account);
-                    break;
-                case "SHAR":
-                    folder = Parser.Parse_SHAR(chunk, encryptionKey, privateKey);
-                    break;
+                        if (account != null)
+                            accounts.Add(account);
+                        break;
+                    case "SHAR":
+                        folder = Parser.Parse_SHAR(chunk, encryptionKey, privateKey);
+                        break;
                 }
             }
 
@@ -537,9 +654,7 @@ namespace PasswordManagerAccess.LastPass
             if (response.IsHttpOk)
                 return new InternalErrorException($"HTTP request to '{response.RequestUri}' failed", response.Error);
 
-            return new InternalErrorException(
-                $"HTTP request to '{response.RequestUri}' failed with status {response.StatusCode}",
-                response.Error);
+            return new InternalErrorException($"HTTP request to '{response.RequestUri}' failed with status {response.StatusCode}", response.Error);
         }
 
         internal static BaseException MakeLoginError(XDocument response)
@@ -558,22 +673,22 @@ namespace PasswordManagerAccess.LastPass
             {
                 switch (cause.Value)
                 {
-                case "unknownemail":
-                    return new BadCredentialsException("Invalid username");
+                    case "unknownemail":
+                        return new BadCredentialsException("Invalid username");
 
-                case "unknownpassword":
-                    return new BadCredentialsException("Invalid password");
+                    case "unknownpassword":
+                        return new BadCredentialsException("Invalid password");
 
-                case "googleauthfailed":
-                case "microsoftauthfailed":
-                case "otpfailed":
-                    return new BadMultiFactorException("Second factor code is incorrect");
+                    case "googleauthfailed":
+                    case "microsoftauthfailed":
+                    case "otpfailed":
+                        return new BadMultiFactorException("Second factor code is incorrect");
 
-                case "multifactorresponsefailed":
-                    return new BadMultiFactorException("Out of band authentication failed");
+                    case "multifactorresponsefailed":
+                        return new BadMultiFactorException("Out of band authentication failed");
 
-                default:
-                    return new InternalErrorException(message?.Value ?? cause.Value);
+                    default:
+                        return new InternalErrorException(message?.Value ?? cause.Value);
                 }
             }
 

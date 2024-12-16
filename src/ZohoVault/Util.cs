@@ -24,9 +24,7 @@ namespace PasswordManagerAccess.ZohoVault
 
         public static string DecryptStringLoose(string ctrCiphertextBase64, byte[] key)
         {
-            return ctrCiphertextBase64.IsNullOrEmpty()
-                ? ""
-                : DecryptString(ctrCiphertextBase64, key);
+            return ctrCiphertextBase64.IsNullOrEmpty() ? "" : DecryptString(ctrCiphertextBase64, key);
         }
 
         public static string DecryptString(string ctrCiphertextBase64, byte[] key)
@@ -44,7 +42,7 @@ namespace PasswordManagerAccess.ZohoVault
         public static byte[] Decrypt(byte[] ctrCiphertext, byte[] key)
         {
             if (ctrCiphertext.Length < 8 + 1)
-                return new byte[] {};
+                return new byte[] { };
 
             // First 8 bytes of the ciphertext is the ctr initial value. Has to be padded with zeros.
             var ctr = ctrCiphertext.Take(8).Concat(new byte[8]).ToArray();
@@ -117,21 +115,22 @@ namespace PasswordManagerAccess.ZohoVault
             {
                 var index = n - 1 - i;
                 int inc = counter[index] + carry;
-                counter[index] = (byte) (inc & 0xff);
+                counter[index] = (byte)(inc & 0xff);
                 carry = inc >> 8;
             }
         }
 
-        private static AesManaged CreateAes256Ecb(byte[] key)
+        // TODO: Move to common crypto module
+        private static Aes CreateAes256Ecb(byte[] key)
         {
-            return new AesManaged
-            {
-                BlockSize = 128,
-                KeySize = 256,
-                Key = key,
-                Mode = CipherMode.ECB,
-                Padding = PaddingMode.None
-            };
+            var aes = Aes.Create();
+            aes.BlockSize = 128;
+            aes.KeySize = 256;
+            aes.Key = key;
+            aes.Mode = CipherMode.ECB;
+            aes.Padding = PaddingMode.None;
+
+            return aes;
         }
     }
 }

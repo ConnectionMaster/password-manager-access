@@ -13,9 +13,8 @@ namespace PasswordManagerAccess.Common
         public int Position => _offset;
         public bool IsEof => Position == Size;
 
-        public OutputSpanStream(byte[] bytes): this(bytes.AsSpan())
-        {
-        }
+        public OutputSpanStream(byte[] bytes)
+            : this(bytes.AsSpan()) { }
 
         public OutputSpanStream(Span<byte> span)
         {
@@ -31,6 +30,16 @@ namespace PasswordManagerAccess.Common
         public void WriteInt32(int value)
         {
             Unsafe.WriteUnaligned(ref _span[CheckAdvance(4)], value);
+        }
+
+        public void WriteUInt32(uint value)
+        {
+            Unsafe.WriteUnaligned(ref _span[CheckAdvance(4)], value);
+        }
+
+        public void WriteUInt32BigEndian(uint value)
+        {
+            WriteUInt32(((value & 0x000000FF) << 24) | ((value & 0x0000FF00) << 8) | ((value & 0x00FF0000) >> 8) | ((value & 0xFF000000) >> 24));
         }
 
         public void WriteUInt64(ulong value)

@@ -3,17 +3,18 @@
 
 using System.Collections.Generic;
 using System.Net;
-using Moq;
+using FluentAssertions;
 using Newtonsoft.Json;
-using Xunit;
-using PasswordManagerAccess.Common;
 using PasswordManagerAccess.Bitwarden;
 using PasswordManagerAccess.Bitwarden.Ui;
+using PasswordManagerAccess.Common;
+using PasswordManagerAccess.Duo;
+using Xunit;
 using R = PasswordManagerAccess.Bitwarden.Response;
 
 namespace PasswordManagerAccess.Test.Bitwarden
 {
-    public class ClientTest: TestBase
+    public class ClientTest : TestBase
     {
         [Theory]
         [InlineData(null)]
@@ -40,9 +41,7 @@ namespace PasswordManagerAccess.Test.Bitwarden
         [Fact]
         public void RequestKdfInfo_returns_kdf_info_pbkdf2()
         {
-            var rest = new RestFlow()
-                .Post("{'kdf': 0, 'kdfIterations': 1337, 'kdfMemory': null, 'kdfParallelism': null}")
-                .ToRestClient();
+            var rest = new RestFlow().Post("{'kdf': 0, 'kdfIterations': 1337, 'kdfMemory': null, 'kdfParallelism': null}").ToRestClient();
 
             var kdf = Client.RequestKdfInfo(Username, rest);
 
@@ -53,9 +52,7 @@ namespace PasswordManagerAccess.Test.Bitwarden
         [Fact]
         public void RequestKdfInfo_returns_kdf_info_argon2di()
         {
-            var rest = new RestFlow()
-                .Post("{'kdf': 1, 'kdfIterations': 3, 'kdfMemory': 64, 'kdfParallelism': 4}")
-                .ToRestClient();
+            var rest = new RestFlow().Post("{'kdf': 1, 'kdfIterations': 3, 'kdfMemory': 64, 'kdfParallelism': 4}").ToRestClient();
 
             var kdf = Client.RequestKdfInfo(Username, rest);
 
@@ -70,7 +67,7 @@ namespace PasswordManagerAccess.Test.Bitwarden
         {
             var rest = new RestFlow()
                 .Post("{'Kdf': 0, 'KdfIterations': 1337, 'kdfMemory': null, 'kdfParallelism': null}")
-                    .ExpectUrl(ApiUrl + "/accounts/prelogin")
+                .ExpectUrl(ApiUrl + "/accounts/prelogin")
                 .ToRestClient(ApiUrl);
 
             Client.RequestKdfInfo(Username, rest);
@@ -79,9 +76,7 @@ namespace PasswordManagerAccess.Test.Bitwarden
         [Fact]
         public void RequestKdfInfo_throws_on_unsupported_kdf_method()
         {
-            var rest = new RestFlow()
-                .Post("{'Kdf': 13, 'KdfIterations': 1337, 'kdfMemory': null, 'kdfParallelism': null}")
-                .ToRestClient();
+            var rest = new RestFlow().Post("{'Kdf': 13, 'KdfIterations': 1337, 'kdfMemory': null, 'kdfParallelism': null}").ToRestClient();
 
             Exceptions.AssertThrowsUnsupportedFeature(() => Client.RequestKdfInfo(Username, rest), "KDF method");
         }
@@ -92,16 +87,10 @@ namespace PasswordManagerAccess.Test.Bitwarden
             var apiRest = new RestFlow();
             var idRest = new RestFlow()
                 .Post("{'token_type': 'Bearer', 'access_token': 'wa-wa-wee-wa'}")
-                    .ExpectUrl(IdentityUrl + "/connect/token")
+                .ExpectUrl(IdentityUrl + "/connect/token")
                 .ToRestClient(IdentityUrl);
 
-            var token = Client.Login(Username,
-                                     PasswordHash,
-                                     DeviceId,
-                                     null,
-                                     SetupSecureStorage(null),
-                                     apiRest,
-                                     idRest);
+            var token = Client.Login(Username, PasswordHash, DeviceId, null, SetupSecureStorage(null), apiRest, idRest);
 
             Assert.Equal("Bearer wa-wa-wee-wa", token);
         }
@@ -112,8 +101,8 @@ namespace PasswordManagerAccess.Test.Bitwarden
             var apiRest = new RestFlow();
             var idRest = new RestFlow()
                 .Post("{'token_type': 'Bearer', 'access_token': 'wa-wa-wee-wa'}")
-                    .ExpectUrl(IdentityUrl + "/connect/token")
-                    .ExpectContent($"twoFactorToken={RememberMeToken}", "twoFactorProvider=5")
+                .ExpectUrl(IdentityUrl + "/connect/token")
+                .ExpectContent($"twoFactorToken={RememberMeToken}", "twoFactorProvider=5")
                 .ToRestClient(IdentityUrl);
 
             Client.Login(Username, PasswordHash, DeviceId, null, SetupSecureStorage(RememberMeToken), apiRest, idRest);
@@ -125,9 +114,9 @@ namespace PasswordManagerAccess.Test.Bitwarden
             var apiRest = new RestFlow();
             var idRest = new RestFlow()
                 .Post("{'token_type': 'Bearer', 'access_token': 'wa-wa-wee-wa'}")
-                    .ExpectUrl(IdentityUrl + "/connect/token")
-                    .ExpectContent(c => Assert.DoesNotContain("twoFactorToken", c))
-                    .ExpectContent(c => Assert.DoesNotContain("twoFactorProvider", c))
+                .ExpectUrl(IdentityUrl + "/connect/token")
+                .ExpectContent(c => Assert.DoesNotContain("twoFactorToken", c))
+                .ExpectContent(c => Assert.DoesNotContain("twoFactorProvider", c))
                 .ToRestClient(IdentityUrl);
 
             Client.Login(Username, PasswordHash, DeviceId, null, SetupSecureStorage(null), apiRest, idRest);
@@ -136,21 +125,23 @@ namespace PasswordManagerAccess.Test.Bitwarden
         [Fact]
         public void Login_asks_ui_to_choose_second_factor_method()
         {
+            // Arrange
             var apiRest = new RestFlow();
             var idRest = new RestFlow()
                 .Post(GetFixture("login-mfa"), HttpStatusCode.BadRequest)
-                    .ExpectUrl(IdentityUrl + "/connect/token")
+                .ExpectUrl(IdentityUrl + "/connect/token")
                 .Post("{'token_type': 'Bearer', 'access_token': 'wa-wa-wee-wa'}")
-                    .ExpectUrl(IdentityUrl + "/connect/token")
+                .ExpectUrl(IdentityUrl + "/connect/token")
                 .ToRestClient(IdentityUrl);
+            var ui = new GoogleAuthProvidingUi();
 
-            var ui = new Mock<IUi>();
-            ui.Setup(x => x.ChooseMfaMethod(It.IsAny<MfaMethod[]>())).Returns(MfaMethod.GoogleAuth);
-            ui.Setup(x => x.ProvideGoogleAuthPasscode()).Returns(new Passcode("123456", false));
+            // Act
+            Client.Login(Username, PasswordHash, DeviceId, ui, SetupSecureStorage(null), apiRest, idRest);
 
-            Client.Login(Username, PasswordHash, DeviceId, ui.Object, SetupSecureStorage(null), apiRest, idRest);
-
-            ui.Verify(x => x.ChooseMfaMethod(It.IsAny<MfaMethod[]>()), Times.Once);
+            // Assert
+            ui.ChooseMfaMethodCalledTimes.Should().Be(1);
+            ui.ProvideGoogleAuthPasscodeCalledTimes.Should().Be(1);
+            ui.CloseCalledTimes.Should().Be(1);
         }
 
         [Fact]
@@ -159,20 +150,23 @@ namespace PasswordManagerAccess.Test.Bitwarden
             var apiRest = new RestFlow();
             var idRest = new RestFlow()
                 .Post(GetFixture("login-mfa-unsupported-only"), HttpStatusCode.BadRequest)
-                    .ExpectUrl(IdentityUrl + "/connect/token")
+                .ExpectUrl(IdentityUrl + "/connect/token")
                 .ToRestClient(IdentityUrl);
 
             Exceptions.AssertThrowsUnsupportedFeature(
                 () => Client.Login(Username, PasswordHash, DeviceId, null, SetupSecureStorage(null), apiRest, idRest),
-                "not supported");
+                "not supported"
+            );
         }
 
         [Fact]
         public void LoginCliApi_makes_POST_request_to_specific_endpoint_and_returns_result_pbdkf2()
         {
             var rest = new RestFlow()
-                .Post("{'token_type': 'Bearer', 'access_token': 'wa-wa-wee-wa', 'Kdf': 0, 'KdfIterations': 1337, 'KdfMemory': null, 'KdfParallelism': null}")
-                    .ExpectUrl(IdentityUrl + "/connect/token")
+                .Post(
+                    "{'token_type': 'Bearer', 'access_token': 'wa-wa-wee-wa', 'Kdf': 0, 'KdfIterations': 1337, 'KdfMemory': null, 'KdfParallelism': null}"
+                )
+                .ExpectUrl(IdentityUrl + "/connect/token")
                 .ToRestClient(IdentityUrl);
 
             var (token, kdfInfo) = Client.LoginCliApi(ClientId, ClientSecret, DeviceId, rest);
@@ -187,7 +181,7 @@ namespace PasswordManagerAccess.Test.Bitwarden
         {
             var rest = new RestFlow()
                 .Post("{'token_type': 'Bearer', 'access_token': 'wa-wa-wee-wa', 'Kdf': 1, 'KdfIterations': 3, 'KdfMemory': 64, 'KdfParallelism': 4}")
-                    .ExpectUrl(IdentityUrl + "/connect/token")
+                .ExpectUrl(IdentityUrl + "/connect/token")
                 .ToRestClient(IdentityUrl);
 
             var (token, kdfInfo) = Client.LoginCliApi(ClientId, ClientSecret, DeviceId, rest);
@@ -203,12 +197,12 @@ namespace PasswordManagerAccess.Test.Bitwarden
         public void LoginCliApi_throws_on_unsupported_kdf()
         {
             var rest = new RestFlow()
-                .Post("{'token_type': 'Bearer', 'access_token': 'wa-wa-wee-wa', 'Kdf': 13, 'KdfIterations': 1337, 'KdfMemory': null, 'KdfParallelism': null}")
+                .Post(
+                    "{'token_type': 'Bearer', 'access_token': 'wa-wa-wee-wa', 'Kdf': 13, 'KdfIterations': 1337, 'KdfMemory': null, 'KdfParallelism': null}"
+                )
                 .ToRestClient(IdentityUrl);
 
-            Exceptions.AssertThrowsUnsupportedFeature(
-                () => Client.LoginCliApi(ClientId, ClientSecret, DeviceId, rest),
-                "KDF method");
+            Exceptions.AssertThrowsUnsupportedFeature(() => Client.LoginCliApi(ClientId, ClientSecret, DeviceId, rest), "KDF method");
         }
 
         [Fact]
@@ -216,12 +210,13 @@ namespace PasswordManagerAccess.Test.Bitwarden
         {
             var rest = new RestFlow()
                 .Post("{'error':'invalid_client'}", status: HttpStatusCode.BadRequest)
-                    .ExpectUrl(IdentityUrl + "/connect/token")
+                .ExpectUrl(IdentityUrl + "/connect/token")
                 .ToRestClient(IdentityUrl);
 
             Exceptions.AssertThrowsBadCredentials(
                 () => Client.LoginCliApi(ClientId, ClientSecret, DeviceId, rest),
-                "Client ID or secret is incorrect");
+                "Client ID or secret is incorrect"
+            );
         }
 
         [Fact]
@@ -229,7 +224,7 @@ namespace PasswordManagerAccess.Test.Bitwarden
         {
             var rest = new RestFlow()
                 .Post("{'token_type': 'Bearer', 'access_token': 'wa-wa-wee-wa'}")
-                    .ExpectUrl(IdentityUrl + "/connect/token")
+                .ExpectUrl(IdentityUrl + "/connect/token")
                 .ToRestClient(IdentityUrl);
 
             var response = Client.RequestAuthToken(Username, PasswordHash, DeviceId, rest);
@@ -244,7 +239,7 @@ namespace PasswordManagerAccess.Test.Bitwarden
         {
             var rest = new RestFlow()
                 .Post(GetFixture("login-mfa"), HttpStatusCode.BadRequest)
-                    .ExpectUrl(IdentityUrl + "/connect/token")
+                .ExpectUrl(IdentityUrl + "/connect/token")
                 .ToRestClient(IdentityUrl);
 
             var response = Client.RequestAuthToken(Username, PasswordHash, DeviceId, rest);
@@ -265,7 +260,7 @@ namespace PasswordManagerAccess.Test.Bitwarden
         {
             var rest = new RestFlow()
                 .Post("{'token_type': 'Bearer', 'access_token': 'wa-wa-wee-wa', 'TwoFactorToken': 'remember-me-token'}")
-                    .ExpectUrl(IdentityUrl + "/connect/token")
+                .ExpectUrl(IdentityUrl + "/connect/token")
                 .ToRestClient(IdentityUrl);
 
             var response = Client.RequestAuthToken(Username, PasswordHash, DeviceId, rest);
@@ -280,7 +275,7 @@ namespace PasswordManagerAccess.Test.Bitwarden
         {
             var rest = new RestFlow()
                 .Post("{'token_type': 'Bearer', 'access_token': 'wa-wa-wee-wa'}")
-                    .ExpectUrl(IdentityUrl + "/connect/token")
+                .ExpectUrl(IdentityUrl + "/connect/token")
                 .ToRestClient(IdentityUrl);
 
             Client.RequestAuthToken(Username, PasswordHash, DeviceId, rest);
@@ -291,8 +286,8 @@ namespace PasswordManagerAccess.Test.Bitwarden
         {
             var rest = new RestFlow()
                 .Post("{'token_type': 'Bearer', 'access_token': 'wa-wa-wee-wa'}")
-                    .ExpectUrl(IdentityUrl + "/connect/token")
-                    .ExpectContent("deviceIdentifier=device-id")
+                .ExpectUrl(IdentityUrl + "/connect/token")
+                .ExpectContent("deviceIdentifier=device-id")
                 .ToRestClient(IdentityUrl);
 
             Client.RequestAuthToken(Username, PasswordHash, DeviceId, rest);
@@ -303,8 +298,8 @@ namespace PasswordManagerAccess.Test.Bitwarden
         {
             var rest = new RestFlow()
                 .Post("{'token_type': 'Bearer', 'access_token': 'wa-wa-wee-wa'}")
-                    .ExpectUrl(IdentityUrl + "/connect/token")
-                    .ExpectHeader("Auth-Email", "dXNlcm5hbWU")
+                .ExpectUrl(IdentityUrl + "/connect/token")
+                .ExpectHeader("Auth-Email", "dXNlcm5hbWU")
                 .ToRestClient(IdentityUrl);
 
             Client.RequestAuthToken(Username, PasswordHash, DeviceId, rest);
@@ -315,24 +310,17 @@ namespace PasswordManagerAccess.Test.Bitwarden
         {
             var rest = new RestFlow()
                 .Post("{'token_type': 'Bearer', 'access_token': 'wa-wa-wee-wa'}")
-                    .ExpectUrl(IdentityUrl + "/connect/token")
-                    .ExpectContent("twoFactorToken=code", "twoFactorProvider=2", "twoFactorRemember=1")
+                .ExpectUrl(IdentityUrl + "/connect/token")
+                .ExpectContent("twoFactorToken=code", "twoFactorProvider=2", "twoFactorRemember=1")
                 .ToRestClient(IdentityUrl);
 
-            Client.RequestAuthToken(Username,
-                                    PasswordHash,
-                                    DeviceId,
-                                    new Client.SecondFactorOptions(R.SecondFactorMethod.Duo, "code", true),
-                                    rest);
+            Client.RequestAuthToken(Username, PasswordHash, DeviceId, new Client.SecondFactorOptions(R.SecondFactorMethod.Duo, "code", true), rest);
         }
 
         [Fact]
         public void DownloadVault_returns_parsed_response()
         {
-            var rest = new RestFlow()
-                .Get(GetFixture("vault"))
-                    .ExpectUrl(ApiUrl + "/sync")
-                .ToRestClient(ApiUrl);
+            var rest = new RestFlow().Get(GetFixture("vault")).ExpectUrl(ApiUrl + "/sync").ToRestClient(ApiUrl);
 
             var response = Client.DownloadVault(rest, "token");
 
@@ -344,10 +332,7 @@ namespace PasswordManagerAccess.Test.Bitwarden
         [Fact]
         public void DownloadVault_makes_GET_request_to_specific_endpoint()
         {
-            var rest = new RestFlow()
-                .Get(GetFixture("vault"))
-                    .ExpectUrl(ApiUrl + "/sync")
-                .ToRestClient(ApiUrl);
+            var rest = new RestFlow().Get(GetFixture("vault")).ExpectUrl(ApiUrl + "/sync").ToRestClient(ApiUrl);
 
             Client.DownloadVault(rest, "token");
         }
@@ -357,8 +342,8 @@ namespace PasswordManagerAccess.Test.Bitwarden
         {
             var rest = new RestFlow()
                 .Get(GetFixture("vault"))
-                    .ExpectUrl(ApiUrl + "/sync")
-                    .ExpectHeader("Authorization", "token")
+                .ExpectUrl(ApiUrl + "/sync")
+                .ExpectHeader("Authorization", "token")
                 .ToRestClient(ApiUrl);
 
             Client.DownloadVault(rest, "token");
@@ -380,8 +365,7 @@ namespace PasswordManagerAccess.Test.Bitwarden
         [Fact]
         public void DecryptVault_returns_collections()
         {
-            var (_, collections, _, _) = Client.DecryptVault(LoadVaultFixture("vault-with-collections"),
-                                                             KekForVaultWithCollections);
+            var (_, collections, _, _) = Client.DecryptVault(LoadVaultFixture("vault-with-collections"), KekForVaultWithCollections);
 
             Assert.Equal(2, collections.Length);
 
@@ -399,8 +383,7 @@ namespace PasswordManagerAccess.Test.Bitwarden
         [Fact]
         public void DecryptVault_returns_organizations()
         {
-            var (_, _, organizations, _) = Client.DecryptVault(LoadVaultFixture("vault-with-collections"),
-                                                               KekForVaultWithCollections);
+            var (_, _, organizations, _) = Client.DecryptVault(LoadVaultFixture("vault-with-collections"), KekForVaultWithCollections);
 
             Assert.Equal(2, organizations.Length);
 
@@ -440,14 +423,12 @@ namespace PasswordManagerAccess.Test.Bitwarden
         [Fact]
         public void DecryptVault_assigns_collections_and_resolves_HidePassword()
         {
-            var (accounts, _, _, _) = Client.DecryptVault(LoadVaultFixture("vault-with-collections"),
-                                                          KekForVaultWithCollections);
+            var (accounts, _, _, _) = Client.DecryptVault(LoadVaultFixture("vault-with-collections"), KekForVaultWithCollections);
 
             Assert.Equal(3, accounts.Length);
 
             Assert.Equal("both", accounts[0].Name);
-            Assert.Equal(new[] { "b06e01d8-ae76-4c15-a6ff-ae6d00ce6c88", "0db9fc3b-3eb2-4af0-bf0d-ae6d00ce87b5" },
-                         accounts[0].CollectionIds);
+            Assert.Equal(new[] { "b06e01d8-ae76-4c15-a6ff-ae6d00ce6c88", "0db9fc3b-3eb2-4af0-bf0d-ae6d00ce87b5" }, accounts[0].CollectionIds);
             Assert.False(accounts[0].HidePassword);
 
             Assert.Equal("hiddenonly", accounts[1].Name);
@@ -474,8 +455,8 @@ namespace PasswordManagerAccess.Test.Bitwarden
             var vault = LoadVaultFixture();
             var folders = new Dictionary<string, string>
             {
-                {"d0e9210c-610b-4427-a344-a99600d462d3", "folder1"},
-                {"94542f0a-d858-46ce-87a5-a99600d47732", "folder2"},
+                { "d0e9210c-610b-4427-a344-a99600d462d3", "folder1" },
+                { "94542f0a-d858-46ce-87a5-a99600d47732", "folder2" },
             };
             var account = Client.ParseAccountItem(vault.Ciphers[0], Key, null, folders, new Dictionary<string, Collection>());
 
@@ -486,6 +467,83 @@ namespace PasswordManagerAccess.Test.Bitwarden
             Assert.Equal("https://facebook.com", account.Url);
             Assert.Equal("Hey, check this out!", account.Note);
             Assert.Equal("folder2", account.Folder);
+        }
+
+        [Fact]
+        public void ParseAccountItemWithFields_returns_account()
+        {
+            var vault = LoadVaultFixture("vault-with-fields");
+            var folders = new Dictionary<string, string>
+            {
+                { "d0e9210c-610b-4427-a344-a99600d462d3", "folder1" },
+                { "94542f0a-d858-46ce-87a5-a99600d47732", "folder2" },
+            };
+            var account = Client.ParseAccountItem(vault.Ciphers[1], Key, null, folders, new Dictionary<string, Collection>());
+
+            Assert.Equal("e481381f-25ca-4245-845d-a981014d20a6", account.Id);
+            Assert.Equal("Google", account.Name);
+            Assert.Equal("larry", account.Username);
+            Assert.Equal("page", account.Password);
+            Assert.Equal("https://google.com", account.Url);
+            Assert.Equal("Yo, look at this!", account.Note);
+            Assert.Equal("", account.Folder);
+
+            Assert.Equal(10, account.CustomFields.Length);
+            Assert.Equal("text1", account.CustomFields[0].Name);
+            Assert.Equal("value1", account.CustomFields[0].Value);
+            Assert.Equal("hidden1", account.CustomFields[1].Name);
+            Assert.Equal("value2", account.CustomFields[1].Value);
+            Assert.Equal("boolean1", account.CustomFields[2].Name);
+            Assert.Equal("true", account.CustomFields[2].Value);
+            Assert.Equal("linked1", account.CustomFields[3].Name);
+            Assert.Equal("page", account.CustomFields[3].Value);
+            Assert.Equal("linked2", account.CustomFields[4].Name);
+            Assert.Equal("larry", account.CustomFields[4].Value);
+            Assert.Equal("", account.CustomFields[5].Name);
+            Assert.Equal("", account.CustomFields[5].Value);
+            Assert.Equal("", account.CustomFields[6].Name);
+            Assert.Equal("", account.CustomFields[6].Value);
+            Assert.Equal("", account.CustomFields[7].Name);
+            Assert.Equal("", account.CustomFields[7].Value);
+            Assert.Equal("", account.CustomFields[8].Name);
+            Assert.Equal("false", account.CustomFields[8].Value);
+            Assert.Equal("", account.CustomFields[9].Name);
+            Assert.Equal("page", account.CustomFields[9].Value);
+        }
+
+        [Fact]
+        public void ParseField_throws_on_invalid_type()
+        {
+            // Arrange
+            var field = new R.Field
+            {
+                Type = 4,
+                Name = null,
+                Value = null,
+            };
+
+            // Act/Assert
+            Exceptions.AssertThrowsUnsupportedFeature(() => Client.ParseField(field, Key, LoginItem), "Custom field type 4");
+        }
+
+        [Theory]
+        [InlineData(null, "")]
+        [InlineData(100, "larry")] // username
+        [InlineData(101, "page")] // password
+        public void ResolveLinkedField_returns_mapped_value(int? linkedId, string expected)
+        {
+            // Arrange/Act
+            var value = Client.ResolveLinkedField(linkedId, Key, LoginItem);
+
+            // Assert
+            value.Should().Be(expected);
+        }
+
+        [Fact]
+        public void ResolveLinkedField_throws_on_unsupported_linked_id()
+        {
+            // Arrange/Act/Assert
+            Exceptions.AssertThrowsUnsupportedFeature(() => Client.ResolveLinkedField(5, Key, LoginItem), "Linked field ID 5");
         }
 
         [Fact]
@@ -520,11 +578,52 @@ namespace PasswordManagerAccess.Test.Bitwarden
         // Helpers
         //
 
-        private ISecureStorage SetupSecureStorage(string token)
+        private class FakeUi : IUi
         {
-            var mock = new Mock<ISecureStorage>();
-            mock.Setup(x => x.LoadString(It.IsAny<string>())).Returns(token);
-            return mock.Object;
+            public virtual DuoChoice ChooseDuoFactor(DuoDevice[] devices) => throw new System.NotImplementedException();
+
+            public virtual string ProvideDuoPasscode(DuoDevice device) => throw new System.NotImplementedException();
+
+            public virtual void UpdateDuoStatus(DuoStatus status, string text) => throw new System.NotImplementedException();
+
+            public virtual void Close() => throw new System.NotImplementedException();
+
+            public virtual MfaMethod ChooseMfaMethod(MfaMethod[] availableMethods) => throw new System.NotImplementedException();
+
+            public virtual Passcode ProvideGoogleAuthPasscode() => throw new System.NotImplementedException();
+
+            public virtual Passcode ProvideEmailPasscode(string emailHint) => throw new System.NotImplementedException();
+
+            public virtual Passcode ProvideYubiKeyPasscode() => throw new System.NotImplementedException();
+        }
+
+        private class GoogleAuthProvidingUi : FakeUi
+        {
+            public int ChooseMfaMethodCalledTimes { get; private set; }
+            public int ProvideGoogleAuthPasscodeCalledTimes { get; private set; }
+            public int CloseCalledTimes { get; private set; }
+
+            public override MfaMethod ChooseMfaMethod(MfaMethod[] availableMethods)
+            {
+                ChooseMfaMethodCalledTimes++;
+                return MfaMethod.GoogleAuth;
+            }
+
+            public override Passcode ProvideGoogleAuthPasscode()
+            {
+                ProvideGoogleAuthPasscodeCalledTimes++;
+                return new Passcode("123456", false);
+            }
+
+            public override void Close()
+            {
+                CloseCalledTimes++;
+            }
+        }
+
+        private static ISecureStorage SetupSecureStorage(string token)
+        {
+            return new MemoryStorage(new Dictionary<string, string> { ["remember-me-token"] = token });
         }
 
         private R.Vault LoadVaultFixture(string name = "vault")
@@ -549,7 +648,18 @@ namespace PasswordManagerAccess.Test.Bitwarden
         private static readonly byte[] Key = "7Zo+OWHAKzu+Ovxisz38Na4en13SnoKHPxFngLUgLiHzSZCWbq42Mohdr6wInwcsWbbezoVaS2vwZlSlB6G7Mg==".Decode64();
         private static readonly byte[] KekForVaultWithCollections = "zTrKlq/dviZ7aFFyRLDdT8Zju2rRM80+NzDtCl4hvlc=".Decode64();
 
-        private const string EncryptedString = "2.8RPqQRT3z5dTQtNAE/2XWw==|cl1uG8jueR0kxPPklGjVJAGCJqaw+YwmDPyNJtIwsXg=|klc2vOsbPPZD5K1MDMf/nqSNLBrOMPVUNycgCgl6l44=";
+        private const string EncryptedString =
+            "2.8RPqQRT3z5dTQtNAE/2XWw==|cl1uG8jueR0kxPPklGjVJAGCJqaw+YwmDPyNJtIwsXg=|klc2vOsbPPZD5K1MDMf/nqSNLBrOMPVUNycgCgl6l44=";
         private const string Plaintext = "Hey, check this out!";
+
+        private static readonly R.Item LoginItem =
+            new()
+            {
+                Login = new R.LoginInfo
+                {
+                    Username = "2.VljekSAM8OlXrGeo3feg4g==|zWnkxbTOPwRhq8w549i94Q==|Un5VXCsoowbqBvIMHqxzF1As5LV6LVuZTXyoJGiNkrU=",
+                    Password = "2.p/TTcAaZh3YdXjsUGv+UIA==|zzvBs2YffTZhK1GeWwncKQ==|84h3MIjJslUuOZkWJKdMkfRxOwDmKLsujnA7Q95jhF0=",
+                },
+            };
     }
 }
