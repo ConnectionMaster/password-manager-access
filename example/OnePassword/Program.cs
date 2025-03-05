@@ -11,22 +11,18 @@ namespace Example
 {
     public static class Program
     {
-        private class TextUi: DuoUi, IUi
+        private class TextUi : DuoUi, IUi
         {
             public Passcode ProvideGoogleAuthPasscode()
             {
                 var passcode = GetAnswer($"Enter Google Authenticator passcode {PressEnterToCancel}");
-                return string.IsNullOrWhiteSpace(passcode)
-                    ? Passcode.Cancel
-                    : new Passcode(passcode, GetRememberMe());
+                return string.IsNullOrWhiteSpace(passcode) ? Passcode.Cancel : new Passcode(passcode, GetRememberMe());
             }
 
             public Passcode ProvideWebAuthnRememberMe()
             {
                 var yesNo = GetAnswer($"Remember this device? {PressEnterToCancel}").ToLower();
-                return string.IsNullOrWhiteSpace(yesNo)
-                    ? Passcode.Cancel
-                    : new Passcode("", yesNo == "y" || yesNo == "yes");
+                return string.IsNullOrWhiteSpace(yesNo) ? Passcode.Cancel : new Passcode("", yesNo == "y" || yesNo == "yes");
             }
         }
 
@@ -42,13 +38,19 @@ namespace Example
             // See config.yaml.example for an example.
             var config = Util.ReadConfig();
 
+            string serviceAccountToken;
+            config.TryGetValue("service-account-token", out serviceAccountToken);
+
             try
             {
-                DumpAllVaults(config["username"],
-                              config["password"],
-                              config["account-key"],
-                              config["device-id"],
-                              config["domain"]);
+                DumpAllVaults(
+                    config["username"],
+                    config["password"],
+                    config["account-key"],
+                    config["domain"],
+                    config["device-id"],
+                    serviceAccountToken ?? ""
+                );
             }
             catch (BaseException e)
             {
@@ -56,24 +58,25 @@ namespace Example
             }
         }
 
-        private static void DumpAllVaults(string username,
-                                          string password,
-                                          string accountKey,
-                                          string uuid,
-                                          string domain)
+        private static void DumpAllVaults(string username, string password, string accountKey, string domain, string uuid, string serviceAccountToken)
         {
-            var clientInfo = new ClientInfo
-            {
-                Username = username,
-                Password = password,
-                AccountKey = accountKey,
-                Uuid = uuid,
-                Domain = string.IsNullOrWhiteSpace(domain) ? Region.Global.ToDomain() : domain,
-                DeviceName = "PMA 1Password example",
-                DeviceModel = "1.0.0",
-            };
+            var device = new AppInfo { Name = "PMA 1Password example", Version = "1.0.0" };
 
-            var session = Client.LogIn(clientInfo, new TextUi(), new PlainStorage());
+            var session = string.IsNullOrEmpty(serviceAccountToken)
+                ? Client.LogIn(
+                    new Credentials
+                    {
+                        Username = username,
+                        Password = password,
+                        AccountKey = accountKey,
+                        Domain = domain,
+                        DeviceUuid = uuid,
+                    },
+                    device,
+                    new TextUi(),
+                    new PlainStorage()
+                )
+                : Client.LogIn(new ServiceAccount { Token = serviceAccountToken }, device);
 
             try
             {
@@ -93,23 +96,70 @@ namespace Example
             Console.WriteLine("{0}: '{1}', '{2}':", index + 1, vaultInfo.Id, vaultInfo.Name);
 
             var vault = Client.OpenVault(vaultInfo, session);
+
+            // Dump accounts
             for (var i = 0; i < vault.Accounts.Length; ++i)
             {
                 var account = vault.Accounts[i];
-                Console.WriteLine("  {0}:\n" +
-                                  "          id: {1}\n" +
-                                  "        name: {2}\n" +
-                                  "    username: {3}\n" +
-                                  "    password: {4}\n" +
-                                  "         url: {5}\n" +
-                                  "        note: {6}\n",
-                                  i + 1,
-                                  account.Id,
-                                  account.Name,
-                                  account.Username,
-                                  account.Password,
-                                  account.MainUrl,
-                                  account.Note);
+                Console.WriteLine(
+                    "  {0}:\n"
+                        + "          id: {1}\n"
+                        + "        name: {2}\n"
+                        + "    username: {3}\n"
+                        + "    password: {4}\n"
+                        + "         url: {5}\n"
+                        + "        note: {6}\n",
+                    i + 1,
+                    account.Id,
+                    account.Name,
+                    account.Username,
+                    account.Password,
+                    account.MainUrl,
+                    account.Note
+                );
+
+                foreach (var url in account.Urls)
+                    Console.WriteLine($"         url: {url.Name}: {url.Value}");
+
+                foreach (var otp in account.Otps)
+                    Console.WriteLine($"         otp: {otp.Name}: {otp.Secret} (section: {otp.Section})");
+
+                foreach (var field in account.Fields)
+                    Console.WriteLine($"       field: {field.Name}: {field.Value} (section: {field.Section})");
+            }
+
+            // Dump SSH keys
+            for (var i = 0; i < vault.SshKeys.Length; ++i)
+            {
+                var sshKey = vault.SshKeys[i];
+                Console.WriteLine(
+                    $"""
+                    {i + 1}:
+                                 name: {sshKey.Name}
+                          description: {sshKey.Description}
+                          private key: {Shorten(sshKey.PrivateKey)}
+                           public key: {Shorten(sshKey.PublicKey)}
+                          fingerprint: {sshKey.Fingerprint}
+                             key type: {sshKey.KeyType}
+                                 note: {sshKey.Note}
+                             original: {Shorten(sshKey.GetPrivateKey(SshKeyFormat.Original))}
+                              OpenSSH: {Shorten(sshKey.GetPrivateKey(SshKeyFormat.OpenSsh))}
+                               PKCS#8: {Shorten(sshKey.GetPrivateKey(SshKeyFormat.Pkcs8))}
+                               PKCS#1: {Shorten(sshKey.GetPrivateKey(SshKeyFormat.Pkcs1))}
+                    """
+                );
+
+                foreach (var field in sshKey.Fields)
+                    Console.WriteLine($"       field: '{field.Name}' = '{Shorten(field.Value)}' (section: '{field.Section}')");
+            }
+
+            static string Shorten(string s, int length = 80)
+            {
+                s = s.Replace("\n", "").Replace("\r", "");
+                if (s.Length < length)
+                    return s;
+
+                return s.Substring(0, length - 3) + "...";
             }
         }
     }

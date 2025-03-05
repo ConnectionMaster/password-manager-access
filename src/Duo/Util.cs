@@ -1,8 +1,9 @@
 // Copyright (C) Dmitry Yakimenko (detunized@gmail.com).
 // Licensed under the terms of the MIT license. See LICENCE for details.
 
-using System;
 using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
 using HtmlAgilityPack;
 using PasswordManagerAccess.Common;
 using PasswordManagerAccess.Duo.Response;
@@ -19,34 +20,28 @@ namespace PasswordManagerAccess.Duo
             return doc;
         }
 
-        internal static T PostForm<T>(string endpoint,
-                                      Dictionary<string, object> parameters,
-                                      RestClient rest,
-                                      Dictionary<string, string> extraHeaders = null)
+        internal static Task<T> PostForm<T>(
+            string endpoint,
+            Dictionary<string, object> parameters,
+            RestClient rest,
+            CancellationToken cancellationToken
+        ) => PostForm<T>(endpoint, parameters, [], rest, cancellationToken);
+
+        internal static async Task<T> PostForm<T>(
+            string endpoint,
+            Dictionary<string, object> parameters,
+            Dictionary<string, string> headers,
+            RestClient rest,
+            CancellationToken cancellationToken
+        )
         {
-            var response = rest.PostForm<Envelope<T>>(endpoint, parameters, headers: extraHeaders);
+            var response = await rest.PostFormAsync<Envelope<T>>(endpoint, parameters, headers, cancellationToken).ConfigureAwait(false);
 
             // All good
             if (response.IsSuccessful && response.Data.Status == "OK" && response.Data.Payload != null)
                 return response.Data.Payload;
 
             throw MakeSpecializedError(response);
-        }
-
-        // Returns null when not found
-        internal static string ExtractQueryParameter(string url, string name)
-        {
-            var nameEquals = name + '=';
-            var start = url.IndexOf(nameEquals, StringComparison.Ordinal);
-            if (start < 0)
-                return null;
-
-            start += nameEquals.Length;
-            var end = url.IndexOf('&', start);
-
-            return end < 0
-                ? url.Substring(start) // The last parameter
-                : url.Substring(start, end - start);
         }
 
         internal static string GetFactorParameterValue(DuoFactor factor)
@@ -57,16 +52,16 @@ namespace PasswordManagerAccess.Duo
                 DuoFactor.Call => "Phone Call",
                 DuoFactor.Passcode => "Passcode",
                 DuoFactor.SendPasscodesBySms => "sms",
-                _ => ""
+                _ => "",
             };
         }
 
-        internal static void UpdateUi(DuoStatus status, string text, IDuoUi ui)
+        internal static async Task UpdateUi(DuoStatus status, string text, IDuoAsyncUi ui, CancellationToken cancellationToken)
         {
             if (text.IsNullOrEmpty())
                 return;
 
-            ui.UpdateDuoStatus(status, text);
+            await ui.UpdateDuoStatus(status, text, cancellationToken).ConfigureAwait(false);
         }
 
         internal static InternalErrorException MakeInvalidResponseError(string message)

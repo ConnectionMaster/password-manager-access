@@ -10,18 +10,14 @@ using Xunit;
 
 namespace PasswordManagerAccess.Test.Dashlane
 {
-    public class VaultTest: TestBase
+    public class VaultTest : TestBase
     {
         [Fact]
         public void Open_returns_accounts_with_existing_device_id()
         {
             var flow = new RestFlow().Post(GetFixture("non-empty-vault"));
 
-            var vault = Vault.Open(Username,
-                                   Password,
-                                   null,
-                                   new Storage(Uki),
-                                   flow);
+            var vault = Vault.Open(Username, Password, null, new Storage(Uki), flow);
 
             Assert.NotEmpty(vault.Accounts);
         }
@@ -31,15 +27,12 @@ namespace PasswordManagerAccess.Test.Dashlane
         {
             var flow = new RestFlow()
                 .Post(GetFixture("email-token-sent"))
+                .Post(GetFixture("email-token-triggered"))
                 .Post(GetFixture("email-token-verified"))
                 .Post(GetFixture("device-registered"))
                 .Post(GetFixture("non-empty-vault"));
 
-            var vault = Vault.Open(Username,
-                                   Password,
-                                   new OtpProvidingUi { Code = Otp, RememberMe = false },
-                                   new Storage(""),
-                                   flow);
+            var vault = Vault.Open(Username, Password, MakeUi(Otp, false), new Storage(""), flow);
 
             Assert.NotEmpty(vault.Accounts);
         }
@@ -53,13 +46,20 @@ namespace PasswordManagerAccess.Test.Dashlane
                 .Post(GetFixture("device-registered"))
                 .Post(GetFixture("non-empty-vault"));
 
-            var vault = Vault.Open(Username,
-                                   Password,
-                                   new OtpProvidingUi { Code = Otp, RememberMe = false },
-                                   new Storage(""),
-                                   flow);
+            var vault = Vault.Open(Username, Password, MakeUi(Otp, false), new Storage(""), flow);
 
             Assert.NotEmpty(vault.Accounts);
+        }
+
+        [Fact]
+        public void Open_throws_on_resend_with_totp()
+        {
+            var flow = new RestFlow().Post(GetFixture("otp-requested"));
+
+            Exceptions.AssertThrowsInternalError(
+                () => Vault.Open(Username, Password, MakeUi(Ui.Passcode.Resend), new Storage(""), flow),
+                "Return value Resend is invalid in this context"
+            );
         }
 
         [Fact]
@@ -68,15 +68,12 @@ namespace PasswordManagerAccess.Test.Dashlane
             var flow = new RestFlow()
                 .Post(GetFixture("invalid-uki"))
                 .Post(GetFixture("email-token-sent"))
+                .Post(GetFixture("email-token-triggered"))
                 .Post(GetFixture("email-token-verified"))
                 .Post(GetFixture("device-registered"))
                 .Post(GetFixture("non-empty-vault"));
 
-            var vault = Vault.Open(Username,
-                                   Password,
-                                   new OtpProvidingUi { Code = Otp, RememberMe = false },
-                                   new Storage(Uki),
-                                   flow);
+            var vault = Vault.Open(Username, Password, MakeUi(Otp, false), new Storage(Uki), flow);
 
             Assert.NotEmpty(vault.Accounts);
         }
@@ -91,11 +88,7 @@ namespace PasswordManagerAccess.Test.Dashlane
                 .Post(GetFixture("device-registered"))
                 .Post(GetFixture("non-empty-vault"));
 
-            var vault = Vault.Open(Username,
-                                   Password,
-                                   new OtpProvidingUi { Code = Otp, RememberMe = false },
-                                   new Storage(Uki),
-                                   flow);
+            var vault = Vault.Open(Username, Password, MakeUi(Otp, false), new Storage(Uki), flow);
 
             Assert.NotEmpty(vault.Accounts);
         }
@@ -103,16 +96,48 @@ namespace PasswordManagerAccess.Test.Dashlane
         [Fact]
         public void Open_throws_on_invalid_email_address()
         {
-            var flow = new RestFlow()
-                .Post(GetFixture("invalid-email"), HttpStatusCode.BadRequest);
+            var flow = new RestFlow().Post(GetFixture("invalid-email"), HttpStatusCode.BadRequest);
 
             Exceptions.AssertThrowsBadCredentials(
-                () => Vault.Open(Username,
-                                 Password,
-                                 new OtpProvidingUi { Code = Otp, RememberMe = false },
-                                 new Storage(""),
-                                 flow),
-                "Invalid username: ");
+                () => Vault.Open(Username, Password, MakeUi(Otp, false), new Storage(""), flow),
+                "Invalid username: "
+            );
+        }
+
+        [Fact]
+        public void Open_returns_accounts_with_email_token_after_1_resend()
+        {
+            var flow = new RestFlow()
+                .Post(GetFixture("email-token-sent"))
+                .Post(GetFixture("email-token-triggered")) // First token trigger
+                .Post(GetFixture("email-token-triggered")) // Resend
+                .Post(GetFixture("email-token-verified"))
+                .Post(GetFixture("device-registered"))
+                .Post(GetFixture("non-empty-vault"));
+
+            var vault = Vault.Open(Username, Password, MakeUi(Ui.Passcode.Resend, new Ui.Passcode(Otp, false)), new Storage(""), flow);
+
+            Assert.NotEmpty(vault.Accounts);
+        }
+
+        [Theory]
+        [InlineData("")]
+        [InlineData("1")]
+        [InlineData("12345")]
+        [InlineData("12345a")]
+        [InlineData("1234567")]
+        public void Open_asks_ui_for_another_token_when_it_is_not_6_digits(string token)
+        {
+            var flow = new RestFlow()
+                .Post(GetFixture("email-token-sent"))
+                .Post(GetFixture("email-token-triggered"))
+                .Post(GetFixture("email-token-verified"))
+                .Post(GetFixture("device-registered"))
+                .Post(GetFixture("non-empty-vault"));
+
+            var vault = Vault.Open(Username, Password, MakeUi(new Ui.Passcode(token, false), new Ui.Passcode(Otp, false)), new Storage(""), flow);
+
+            Assert.NotEmpty(vault.Accounts);
         }
 
         [Fact]
@@ -120,17 +145,14 @@ namespace PasswordManagerAccess.Test.Dashlane
         {
             var flow = new RestFlow()
                 .Post(GetFixture("email-token-sent"))
+                .Post(GetFixture("email-token-triggered"))
                 .Post(GetFixture("invalid-email-token"), HttpStatusCode.BadRequest)
                 .Post(GetFixture("invalid-email-token"), HttpStatusCode.BadRequest)
                 .Post(GetFixture("email-token-verified"))
                 .Post(GetFixture("device-registered"))
                 .Post(GetFixture("non-empty-vault"));
 
-            var vault = Vault.Open(Username,
-                                   Password,
-                                   new OtpProvidingUi { Code = Otp, RememberMe = false },
-                                   new Storage(""),
-                                   flow);
+            var vault = Vault.Open(Username, Password, MakeUi(Otp, false), new Storage(""), flow);
 
             Assert.NotEmpty(vault.Accounts);
         }
@@ -144,13 +166,7 @@ namespace PasswordManagerAccess.Test.Dashlane
                 .Post(GetFixture("invalid-email-token"), HttpStatusCode.BadRequest)
                 .Post(GetFixture("invalid-email-token"), HttpStatusCode.BadRequest);
 
-            Exceptions.AssertThrowsBadMultiFactor(
-                () => Vault.Open(Username,
-                                 Password,
-                                 new OtpProvidingUi { Code = Otp, RememberMe = false },
-                                 new Storage(""),
-                                 flow),
-                "MFA failed: ");
+            Exceptions.AssertThrowsBadMultiFactor(() => Vault.Open(Username, Password, MakeUi(Otp, false), new Storage(""), flow), "MFA failed: ");
         }
 
         [Theory]
@@ -160,17 +176,14 @@ namespace PasswordManagerAccess.Test.Dashlane
         {
             var flow = new RestFlow()
                 .Post(GetFixture("email-token-sent"))
+                .Post(GetFixture("email-token-triggered"))
                 .Post(GetFixture("email-token-verified"))
                 .Post(GetFixture("device-registered"))
                 .Post(GetFixture("non-empty-vault"));
 
             var storage = new Storage("");
 
-            Vault.Open(Username,
-                       Password,
-                       new OtpProvidingUi { Code = Otp, RememberMe = rememberMe },
-                       storage,
-                       flow);
+            Vault.Open(Username, Password, MakeUi(Otp, rememberMe), storage, flow);
 
             Assert.Equal(expectedDeviceId, storage.Values["device-uki"]);
         }
@@ -181,17 +194,14 @@ namespace PasswordManagerAccess.Test.Dashlane
             var flow = new RestFlow()
                 .Post(GetFixture("invalid-uki"))
                 .Post(GetFixture("email-token-sent"))
+                .Post(GetFixture("email-token-triggered"))
                 .Post(GetFixture("email-token-verified"))
                 .Post(GetFixture("device-registered"))
                 .Post(GetFixture("non-empty-vault"));
 
             var storage = new Storage("invalid-uki");
 
-            var vault = Vault.Open(Username,
-                                   Password,
-                                   new OtpProvidingUi { Code = Otp, RememberMe = false },
-                                   storage,
-                                   flow);
+            var vault = Vault.Open(Username, Password, MakeUi(Otp, false), storage, flow);
 
             Assert.Equal("", storage.Values["device-uki"]);
         }
@@ -205,31 +215,31 @@ namespace PasswordManagerAccess.Test.Dashlane
         [Fact]
         public void Open_opens_a_vault_with_empty_fullfile_and_one_add_transaction()
         {
-            Assert.Equal(new[]{Dude}, Accounts("empty-fullfile-one-add-transaction"));
+            Assert.Equal(new[] { Dude }, Accounts("empty-fullfile-one-add-transaction"));
         }
 
         [Fact]
         public void Open_opens_a_vault_with_empty_fullfile_and_two_add_transations()
         {
-            Assert.Equal(new[]{Dude, Nam}, Accounts("empty-fullfile-two-add-transactions"));
+            Assert.Equal(new[] { Dude, Nam }, Accounts("empty-fullfile-two-add-transactions"));
         }
 
         [Fact]
         public void Open_opens_a_vault_with_empty_fullfile_and_two_add_and_one_remove_transations()
         {
-            Assert.Equal(new[]{Dude, Nam}, Accounts("empty-fullfile-two-add-one-remove-transactions"));
+            Assert.Equal(new[] { Dude, Nam }, Accounts("empty-fullfile-two-add-one-remove-transactions"));
         }
 
         [Fact]
         public void Open_opens_a_vault_with_two_accounts_in_fullfile()
         {
-            Assert.Equal(new[]{Dude, Nam}, Accounts("two-accounts-in-fullfile"));
+            Assert.Equal(new[] { Dude, Nam }, Accounts("two-accounts-in-fullfile"));
         }
 
         [Fact]
         public void Open_opens_a_vault_with_two_accounts_in_fullfile_and_one_remove_transaction()
         {
-            Assert.Equal(new[]{Dude}, Accounts("two-accounts-in-fullfile-one-remove-transaction"));
+            Assert.Equal(new[] { Dude }, Accounts("two-accounts-in-fullfile-one-remove-transaction"));
         }
 
         [Fact]
@@ -241,23 +251,55 @@ namespace PasswordManagerAccess.Test.Dashlane
         [Fact]
         public void Open_opens_a_vault_with_two_accounts_in_fullfile_and_two_remove_and_one_add_transactions()
         {
-            Assert.Equal(new[]{Dude}, Accounts("two-accounts-in-fullfile-two-remove-one-add-transactions"));
+            Assert.Equal(new[] { Dude }, Accounts("two-accounts-in-fullfile-two-remove-one-add-transactions"));
         }
 
         //
         // Helpers
         //
 
-        class OtpProvidingUi: Ui
+        class SequenceUi : Ui
         {
-            public string Code { get; set; }
-            public bool RememberMe { get; set; }
+            private readonly bool _loop;
+            private readonly Passcode[] _passcodes;
+            private int _current;
 
-            public override Passcode ProvideGoogleAuthPasscode(int attempt) => new Passcode(Code, RememberMe);
-            public override Passcode ProvideEmailPasscode(int attempt) => new Passcode(Code, RememberMe);
+            public SequenceUi(Passcode[] passcodes, bool loop = false)
+            {
+                _passcodes = passcodes;
+                _loop = loop;
+            }
+
+            public override Passcode ProvideGoogleAuthPasscode(int attempt) => Next();
+
+            public override Passcode ProvideEmailPasscode(int attempt) => Next();
+
+            private Passcode Next()
+            {
+                if (_current >= _passcodes.Length)
+                    Assert.Fail("SequenceUi: No more passcodes");
+
+                var passcode = _passcodes[_current];
+                _current++;
+
+                if (_loop && _current >= _passcodes.Length)
+                    _current = 0;
+
+                return passcode;
+            }
         }
 
-        class Storage: ISecureStorage
+        Ui MakeUi(string code, bool rememberMe)
+        {
+            return new SequenceUi(new[] { new Ui.Passcode(code, rememberMe) }, true);
+        }
+
+        Ui MakeUi(params Ui.Passcode[] passcodes)
+        {
+            return new SequenceUi(passcodes, false);
+        }
+
+        class Storage : ISecureStorage
         {
             public Dictionary<string, string> Values { get; } = new Dictionary<string, string>();
 
@@ -280,10 +322,7 @@ namespace PasswordManagerAccess.Test.Dashlane
         private string[] Accounts(string filename)
         {
             var flow = new RestFlow().Post(GetFixture(filename));
-            return Vault.Open(Username, Password, null, new Storage(Uki), flow)
-                .Accounts
-                .Select(i => i.Name)
-                .ToArray();
+            return Vault.Open(Username, Password, null, new Storage(Uki), flow).Accounts.Select(i => i.Name).ToArray();
         }
 
         //
@@ -297,6 +336,6 @@ namespace PasswordManagerAccess.Test.Dashlane
         private const string Dude = "dude.com";
         private const string Nam = "nam.com";
 
-        private const string Otp = "1337";
+        private const string Otp = "123456";
     }
 }

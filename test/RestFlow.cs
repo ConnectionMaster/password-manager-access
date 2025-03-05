@@ -6,12 +6,14 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Threading;
+using System.Threading.Tasks;
 using PasswordManagerAccess.Common;
 using Xunit;
 
 namespace PasswordManagerAccess.Test
 {
-    internal class RestFlow: IRestTransport
+    internal class RestFlow : HttpMessageHandler, IRestTransport
     {
         public class ResponseContent
         {
@@ -34,6 +36,7 @@ namespace PasswordManagerAccess.Test
             }
 
             public static implicit operator ResponseContent(string text) => new ResponseContent(text);
+
             public static implicit operator ResponseContent(byte[] binary) => new ResponseContent(binary);
         }
 
@@ -41,24 +44,32 @@ namespace PasswordManagerAccess.Test
         // GET
         //
 
-        public RestFlow Get(ResponseContent response,
-                            HttpStatusCode status = HttpStatusCode.OK,
-                            Dictionary<string, string> headers = null,
-                            Dictionary<string, string> cookies = null,
-                            Exception error = null)
+        public RestFlow Get(
+            ResponseContent response,
+            HttpStatusCode status = HttpStatusCode.OK,
+            Dictionary<string, string> headers = null,
+            Dictionary<string, string> cookies = null,
+            string responseUrl = null,
+            Exception error = null
+        )
         {
-            _responses.Add(new Response(method: HttpMethod.Get,
-                                        content: response,
-                                        status: status,
-                                        headers: headers ?? NoHeaders,
-                                        cookies: cookies ?? NoCookies,
-                                        error: error));
+            _responses.Add(
+                new Response(
+                    method: HttpMethod.Get,
+                    content: response,
+                    status: status,
+                    headers: headers ?? NoHeaders,
+                    cookies: cookies ?? NoCookies,
+                    responseUrl: responseUrl,
+                    error: error
+                )
+            );
             return this;
         }
 
         public RestFlow Get(ResponseContent response, Exception error)
         {
-            return Get(response, HttpStatusCode.OK, NoHeaders, NoCookies, error);
+            return Get(response, HttpStatusCode.OK, NoHeaders, NoCookies, NoResponseUrl, error);
         }
 
         public RestFlow Get(Exception error)
@@ -70,24 +81,32 @@ namespace PasswordManagerAccess.Test
         // POST
         //
 
-        public RestFlow Post(ResponseContent response,
-                             HttpStatusCode status = HttpStatusCode.OK,
-                             Dictionary<string, string> headers = null,
-                             Dictionary<string, string> cookies = null,
-                             Exception error = null)
+        public RestFlow Post(
+            ResponseContent response,
+            HttpStatusCode status = HttpStatusCode.OK,
+            Dictionary<string, string> headers = null,
+            Dictionary<string, string> cookies = null,
+            string responseUrl = null,
+            Exception error = null
+        )
         {
-            _responses.Add(new Response(method: HttpMethod.Post,
-                                        content: response,
-                                        status: status,
-                                        headers: headers ?? NoHeaders,
-                                        cookies: cookies ?? NoCookies,
-                                        error: error));
+            _responses.Add(
+                new Response(
+                    method: HttpMethod.Post,
+                    content: response,
+                    status: status,
+                    headers: headers ?? NoHeaders,
+                    cookies: cookies ?? NoCookies,
+                    responseUrl: responseUrl,
+                    error: error
+                )
+            );
             return this;
         }
 
         public RestFlow Post(ResponseContent response, Exception error)
         {
-            return Post(response, HttpStatusCode.OK, NoHeaders, NoCookies, error);
+            return Post(response, HttpStatusCode.OK, NoHeaders, NoCookies, NoResponseUrl, error);
         }
 
         public RestFlow Post(Exception error)
@@ -99,24 +118,32 @@ namespace PasswordManagerAccess.Test
         // PUT
         //
 
-        public RestFlow Put(ResponseContent response,
-                            HttpStatusCode status = HttpStatusCode.OK,
-                            Dictionary<string, string> headers = null,
-                            Dictionary<string, string> cookies = null,
-                            Exception error = null)
+        public RestFlow Put(
+            ResponseContent response,
+            HttpStatusCode status = HttpStatusCode.OK,
+            Dictionary<string, string> headers = null,
+            Dictionary<string, string> cookies = null,
+            string responseUrl = null,
+            Exception error = null
+        )
         {
-            _responses.Add(new Response(method: HttpMethod.Put,
-                                        content: response,
-                                        status: status,
-                                        headers: headers ?? NoHeaders,
-                                        cookies: cookies ?? NoCookies,
-                                        error: error));
+            _responses.Add(
+                new Response(
+                    method: HttpMethod.Put,
+                    content: response,
+                    status: status,
+                    headers: headers ?? NoHeaders,
+                    cookies: cookies ?? NoCookies,
+                    responseUrl: responseUrl,
+                    error: error
+                )
+            );
             return this;
         }
 
         public RestFlow Put(ResponseContent response, Exception error)
         {
-            return Put(response, HttpStatusCode.OK, NoHeaders, NoCookies, error);
+            return Put(response, HttpStatusCode.OK, NoHeaders, NoCookies, NoResponseUrl, error);
         }
 
         public RestFlow Put(Exception error)
@@ -136,6 +163,30 @@ namespace PasswordManagerAccess.Test
         public static implicit operator RestClient(RestFlow flow)
         {
             return flow.ToRestClient();
+        }
+
+        //
+        // RestSharp.RestClient
+        //
+
+        public RestAsync.Config ToRestConfig()
+        {
+            return new RestAsync.Config { ConfigureMessageHandler = _ => this };
+        }
+
+        public static implicit operator RestAsync.Config(RestFlow flow)
+        {
+            return flow.ToRestConfig();
+        }
+
+        public RestSharp.RestClient ToAsyncRest(string baseUrl = "https://does.not.matter")
+        {
+            return RestAsync.Create(baseUrl, this);
+        }
+
+        public static implicit operator RestSharp.RestClient(RestFlow flow)
+        {
+            return flow.ToAsyncRest();
         }
 
         //
@@ -165,7 +216,7 @@ namespace PasswordManagerAccess.Test
 
         public RestFlow ExpectHeader(string name, string value)
         {
-            return ExpectHeaders(new Dictionary<string, string> {{name, value}});
+            return ExpectHeaders(new Dictionary<string, string> { { name, value } });
         }
 
         public RestFlow ExpectHeaders(Dictionary<string, string> partialHeaders)
@@ -177,7 +228,7 @@ namespace PasswordManagerAccess.Test
 
         public RestFlow ExpectCookie(string name, string value)
         {
-            return ExpectCookies(new Dictionary<string, string> {{name, value}});
+            return ExpectCookies(new Dictionary<string, string> { { name, value } });
         }
 
         public RestFlow ExpectCookies(Dictionary<string, string> partialCookies)
@@ -214,22 +265,27 @@ namespace PasswordManagerAccess.Test
             public readonly HttpStatusCode Status;
             public readonly Dictionary<string, string> Headers;
             public readonly Dictionary<string, string> Cookies;
+            public readonly string ResponseUrl;
             public readonly Exception Error;
 
             // Expected to be received from the caller
             public Expected Expected;
 
-            public Response(HttpMethod method,
-                            ResponseContent content,
-                            HttpStatusCode status,
-                            Dictionary<string, string> headers,
-                            Dictionary<string, string> cookies,
-                            Exception error)
+            public Response(
+                HttpMethod method,
+                ResponseContent content,
+                HttpStatusCode status,
+                Dictionary<string, string> headers,
+                Dictionary<string, string> cookies,
+                string responseUrl,
+                Exception error
+            )
             {
                 Content = content;
                 Status = status;
                 Headers = headers;
                 Cookies = cookies;
+                ResponseUrl = responseUrl;
                 Error = error;
                 Expected = new Expected(method);
             }
@@ -252,13 +308,15 @@ namespace PasswordManagerAccess.Test
         // IRestTransport implementation
         //
 
-        public void MakeRequest<TContent>(Uri uri,
-                                          HttpMethod method,
-                                          HttpContent content,
-                                          IReadOnlyDictionary<string, string> headers,
-                                          IReadOnlyDictionary<string, string> cookies,
-                                          int maxRedirectCount,
-                                          RestResponse<TContent> allocatedResult)
+        public void MakeRequest<TContent>(
+            Uri uri,
+            HttpMethod method,
+            HttpContent content,
+            IReadOnlyDictionary<string, string> headers,
+            IReadOnlyDictionary<string, string> cookies,
+            int maxRedirectCount,
+            RestResponse<TContent> allocatedResult
+        )
         {
             // Make sure we don't try to request in parallel during testing.
             // Otherwise RestFlow has to be reworked to be made thread safe.
@@ -266,16 +324,76 @@ namespace PasswordManagerAccess.Test
                 MakeRequestLocked(uri, method, content, headers, cookies, maxRedirectCount, allocatedResult);
         }
 
-        private void MakeRequestLocked<TContent>(Uri uri,
-                                                 HttpMethod method,
-                                                 HttpContent content,
-                                                 IReadOnlyDictionary<string, string> headers,
-                                                 IReadOnlyDictionary<string, string> cookies,
-                                                 int maxRedirectCount,
-                                                 RestResponse<TContent> allocatedResult)
+        // TODO: Fix this!
+#pragma warning disable CS1998 // Async method lacks 'await' operators and will run synchronously
+        public async Task MakeRequestAsync<TContent>(
+#pragma warning restore CS1998 // Async method lacks 'await' operators and will run synchronously
+            Uri uri,
+            HttpMethod method,
+            HttpContent content,
+            IReadOnlyDictionary<string, string> headers,
+            IReadOnlyDictionary<string, string> cookies,
+            int maxRedirectCount,
+            RestResponse<TContent> allocatedResult,
+            CancellationToken cancellationToken
+        )
+        {
+            // TODO: Implement this properly
+            MakeRequest(uri, method, content, headers, cookies, maxRedirectCount, allocatedResult);
+        }
+
+        //
+        // HttpMessageHandler implementation
+        //
+
+        // This adapter fits the RestFlow into the RestClient/HttpClient pipeline
+        // TODO: This will not be needed once we switch over to the RestClient completely
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            // The cookies are coming in the headers, so we have to parse them out
+            var cookies = NoCookies;
+            if (request.Headers.TryGetValues("Cookie", out var cookieHeader))
+            {
+                var cc = new CookieContainer();
+                cc.SetCookies(request.RequestUri!, cookieHeader.JoinToString("; "));
+                cookies = cc.GetCookies(request.RequestUri).Cast<Cookie>().ToDictionary(x => x.Name, x => x.Value);
+            }
+
+            var result = new RestResponse<string>();
+            MakeRequest(
+                request.RequestUri,
+                request.Method,
+                request.Content,
+                request.Headers.ToDictionary(x => x.Key, x => x.Value.First()),
+                cookies,
+                0,
+                result
+            );
+
+            var response = new HttpResponseMessage(result.StatusCode) { Content = new StringContent(result.Content) };
+
+            foreach (var header in result.Headers)
+                response.Headers.TryAddWithoutValidation(header.Key, header.Value);
+
+            // Need to convert the cookies into the Set-Cookie headers for RestClient to pick them up
+            foreach (var cookie in result.Cookies)
+                response.Headers.TryAddWithoutValidation("Set-Cookie", $"{cookie.Key}={cookie.Value}");
+
+            return Task.FromResult(response);
+        }
+
+        private void MakeRequestLocked<TContent>(
+            Uri uri,
+            HttpMethod method,
+            HttpContent content,
+            IReadOnlyDictionary<string, string> headers,
+            IReadOnlyDictionary<string, string> cookies,
+            int maxRedirectCount,
+            RestResponse<TContent> allocatedResult
+        )
         {
             if (_currentIndex >= _responses.Count)
-                Assert.True(false, $"Too many requests, there's no response available for {method} to '{uri}'");
+                Assert.Fail($"Too many requests, there's no response available for {method} to '{uri}'");
 
             var r = _responses[_currentIndex++];
             var e = r.Expected;
@@ -316,25 +434,21 @@ namespace PasswordManagerAccess.Test
             allocatedResult.Headers = r.Headers;
             allocatedResult.Error = r.Error;
             allocatedResult.Cookies = r.Cookies;
-            allocatedResult.RequestUri = uri;
+            allocatedResult.RequestUri = r.ResponseUrl == null ? uri : new Uri(r.ResponseUrl);
 
             switch (allocatedResult)
             {
-            case RestResponse<string> text:
-                Assert.False(r.Content.IsBinary, ErrorMessage("Expected a text request, got binary"));
-                text.Content = r.Content.Text;
-                break;
-            case RestResponse<byte[]> text:
-                Assert.True(r.Content.IsBinary, ErrorMessage("Expected a binary request, got text"));
-                text.Content = r.Content.Binary;
-                break;
-            default:
-                throw new ArgumentException($"Unsupported content type {typeof(TContent)}");
+                case RestResponse<string> text:
+                    Assert.False(r.Content.IsBinary, ErrorMessage("Expected a text request, got binary"));
+                    text.Content = r.Content.Text;
+                    break;
+                case RestResponse<byte[]> text:
+                    Assert.True(r.Content.IsBinary, ErrorMessage("Expected a binary request, got text"));
+                    text.Content = r.Content.Binary;
+                    break;
+                default:
+                    throw new ArgumentException($"Unsupported content type {typeof(TContent)}");
             }
-        }
-
-        public void Dispose()
-        {
         }
 
         //
@@ -344,6 +458,7 @@ namespace PasswordManagerAccess.Test
         private static readonly string[] NoFragments = new string[0];
         private static readonly Dictionary<string, string> NoHeaders = new Dictionary<string, string>();
         private static readonly Dictionary<string, string> NoCookies = new Dictionary<string, string>();
+        private const string NoResponseUrl = null;
 
         private int _currentIndex = 0;
         private readonly List<Response> _responses = new List<Response>();

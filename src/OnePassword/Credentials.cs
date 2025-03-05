@@ -3,15 +3,30 @@
 
 namespace PasswordManagerAccess.OnePassword
 {
-    public class ClientInfo
+    public class Credentials
     {
         public string Username { get; set; }
         public string Password { get; set; }
-        public string AccountKey { get; set; }
-        public string Uuid { get; set; }
-        public string Domain { get; set; } // Use Region.ToDomain to convert from Region
-        public string DeviceName { get; set; }
-        public string DeviceModel { get; set; }
+
+        public string AccountKey
+        {
+            get => _accountKey;
+            set
+            {
+                _accountKey = value;
+                _parsedAccountKey = null;
+            }
+        }
+
+        public string Domain { get; set; }
+        public string DeviceUuid { get; set; }
+
+        //
+        // Internal
+        //
+
+        internal string SrpX { get; set; }
+        internal AesKey Key { get; set; }
 
         internal AccountKey ParsedAccountKey
         {
@@ -24,6 +39,11 @@ namespace PasswordManagerAccess.OnePassword
             }
         }
 
+        //
+        // Private
+        //
+
+        private string _accountKey;
         private AccountKey _parsedAccountKey;
     }
 }

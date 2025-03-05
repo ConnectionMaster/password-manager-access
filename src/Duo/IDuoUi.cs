@@ -1,9 +1,14 @@
 // Copyright (C) Dmitry Yakimenko (detunized@gmail.com).
 // Licensed under the terms of the MIT license. See LICENCE for details.
 
+using System.Threading;
+using System.Threading.Tasks;
+using OneOf;
+using PasswordManagerAccess.Common;
+
 namespace PasswordManagerAccess.Duo
 {
-    // Adds Duo functionality to the module-specific Ui class.
+    // TODO: Remove this when done with the migration
     public interface IDuoUi
     {
         // To cancel return null
@@ -16,46 +21,37 @@ namespace PasswordManagerAccess.Duo
         void UpdateDuoStatus(DuoStatus status, string text);
     }
 
-    public enum DuoFactor
-    {
-        Push,
-        Call,
-        Passcode,
-        SendPasscodesBySms,
-    }
+    //
+    // Internal
+    //
 
-    public enum DuoStatus
+    internal class DuoUiToAsyncUiAdapter(IDuoUi ui) : IDuoAsyncUi
     {
-        Success,
-        Error,
-        Info,
-    }
-
-    public class DuoChoice
-    {
-        public readonly DuoDevice Device;
-        public readonly DuoFactor Factor;
-        public readonly bool RememberMe;
-
-        public DuoChoice(DuoDevice device, DuoFactor factor, bool rememberMe)
+        public Task<OneOf<DuoChoice, MfaMethod, DuoCancelled>> ChooseDuoFactor(
+            DuoDevice[] devices,
+            MfaMethod[] otherMethods,
+            CancellationToken cancellationToken
+        )
         {
-            Device = device;
-            Factor = factor;
-            RememberMe = rememberMe;
+            var choice = ui.ChooseDuoFactor(devices);
+            return Task.FromResult(choice == null ? IDuoAsyncUi.CancelChoice() : IDuoAsyncUi.Choice(choice.Device, choice.Factor, choice.RememberMe));
         }
-    }
 
-    public class DuoDevice
-    {
-        public readonly string Id;
-        public readonly string Name;
-        public readonly DuoFactor[] Factors;
-
-        public DuoDevice(string id, string name, DuoFactor[] factors)
+        public Task<OneOf<DuoPasscode, DuoCancelled>> ProvideDuoPasscode(DuoDevice device, CancellationToken cancellationToken)
         {
-            Id = id;
-            Name = name;
-            Factors = factors;
+            var passcode = ui.ProvideDuoPasscode(device);
+            return Task.FromResult(passcode.IsNullOrEmpty() ? IDuoAsyncUi.CancelPasscode() : IDuoAsyncUi.Passcode(passcode));
+        }
+
+        public Task DuoDone(CancellationToken cancellationToken)
+        {
+            return Task.CompletedTask;
+        }
+
+        public Task UpdateDuoStatus(DuoStatus status, string text, CancellationToken cancellationToken)
+        {
+            ui.UpdateDuoStatus(status, text);
+            return Task.CompletedTask;
         }
     }
 }

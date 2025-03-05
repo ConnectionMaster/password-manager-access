@@ -1,8 +1,8 @@
 # Password Manager Access for .NET in C#
 
-[![Build status](https://ci.appveyor.com/api/projects/status/83qpps4fqdv0vn60?svg=true)](https://ci.appveyor.com/project/detunized/password-manager-access)
-[![Build Status](https://detunized.visualstudio.com/password-manager-access/_apis/build/status/detunized.password-manager-access?branchName=master)](https://detunized.visualstudio.com/password-manager-access/_build/latest?definitionId=1&branchName=master)
-[![NuGet Badge](https://buildstats.info/nuget/PasswordManagerAccess)](https://www.nuget.org/packages/PasswordManagerAccess/)
+[![.NET build, test and release](https://github.com/detunized/password-manager-access/actions/workflows/ci.yaml/badge.svg)](https://github.com/detunized/password-manager-access/actions/workflows/ci.yaml)
+[![NuGet Badge](https://img.shields.io/nuget/v/PasswordManagerAccess)](https://www.nuget.org/packages/PasswordManagerAccess/)
+[![NuGet Badge](https://img.shields.io/nuget/dt/PasswordManagerAccess)](https://www.nuget.org/packages/PasswordManagerAccess/)
 
 Password Manager Access provides read only access API to various online
 password managers. This unified library is a successor to a bunch of
@@ -16,9 +16,10 @@ The following services are supported by this library:
   - [1Password](https://1password.com)
   - [Bitwarden](https://bitwarden.com)
   - [Dashlane](https://dashlane.com)
-  - [Dropbox Passwords (work in progress)](https://www.dropbox.com/features/security/passwords)
-  - [Kaspersky Password Manager](https://www.kaspersky.com/password-manager)
+  - [Dropbox Passwords](https://www.dropbox.com/features/security/passwords)
+  - [Kaspersky Password Manager (work in progress)](https://www.kaspersky.com/password-manager)
   - [LastPass](https://lastpass.com)
+  - [ProtonPass](https://proton.me/pass)
   - [RoboForm](https://roboform.com)
   - [Sticky Password](https://www.stickypassword.com)
   - [True Key](https://www.truekey.com)
