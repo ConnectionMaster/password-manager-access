@@ -24,6 +24,11 @@ namespace PasswordManagerAccess.Test
             return AssertThrows<CanceledMultiFactorException>(action, message);
         }
 
+        public static CanceledSsoLoginException AssertThrowsCanceledSsoLogin(Action action, string message = "")
+        {
+            return AssertThrows<CanceledSsoLoginException>(action, message);
+        }
+
         public static NetworkErrorException AssertThrowsNetworkError(Action action, string message = "")
         {
             return AssertThrows<NetworkErrorException>(action, message);
@@ -44,7 +49,8 @@ namespace PasswordManagerAccess.Test
             return AssertThrows<CryptoException>(action, message);
         }
 
-        private static T AssertThrows<T>(Action action, string message) where T: BaseException
+        private static T AssertThrows<T>(Action action, string message)
+            where T : BaseException
         {
             var e = Assert.Throws<T>(action);
             Assert.NotNull(e.Message);

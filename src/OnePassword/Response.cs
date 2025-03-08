@@ -1,12 +1,23 @@
 // Copyright (C) Dmitry Yakimenko (detunized@gmail.com).
 // Licensed under the terms of the MIT license. See LICENCE for details.
 
+using System;
 using System.ComponentModel;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 
 // TODO: Rename to Wire or Model since not all this things are responses
 namespace PasswordManagerAccess.OnePassword.Response
 {
+    internal class UserLoginInfo
+    {
+        [JsonProperty("userUuid")]
+        public readonly string UserUuid;
+
+        [JsonProperty("signInAddress")]
+        public readonly string Url;
+    }
+
     internal class NewSession
     {
         [JsonProperty("status", Required = Required.Always)]
@@ -228,7 +239,7 @@ namespace PasswordManagerAccess.OnePassword.Response
         public readonly bool Enabled;
     }
 
-    internal class WebAuthnMfa: BasicMfa
+    internal class WebAuthnMfa : BasicMfa
     {
         [JsonProperty("keyHandles")]
         public readonly string[] KeyHandles;
@@ -237,7 +248,7 @@ namespace PasswordManagerAccess.OnePassword.Response
         public readonly string Challenge;
     }
 
-    internal class DuoMfa: BasicMfa
+    internal class DuoMfa : BasicMfa
     {
         // Cannot make these fields required in case they are not sent when Duo is disabled.
         // Need to check for validity later where they are being used.
@@ -312,12 +323,13 @@ namespace PasswordManagerAccess.OnePassword.Response
 
     internal class VaultItemOverview
     {
-        [JsonProperty("title", DefaultValueHandling = DefaultValueHandling.Populate)]
-        [DefaultValue("")]
+        [JsonProperty("title")]
         public readonly string Title;
 
-        [JsonProperty("url", DefaultValueHandling = DefaultValueHandling.Populate)]
-        [DefaultValue("")]
+        [JsonProperty("ainfo")]
+        public readonly string AdditionalInfo;
+
+        [JsonProperty("url")]
         public readonly string Url;
 
         [JsonProperty("URLs")]
@@ -379,13 +391,71 @@ namespace PasswordManagerAccess.OnePassword.Response
 
     internal class VaultItemSectionField
     {
-        [JsonProperty("t", DefaultValueHandling = DefaultValueHandling.Populate)]
-        [DefaultValue("")]
+        [JsonProperty("n")]
+        public readonly string Id;
+
+        [JsonProperty("t")]
         public readonly string Name;
 
-        [JsonProperty("v", DefaultValueHandling = DefaultValueHandling.Populate)]
-        [DefaultValue("")]
+        [JsonConverter(typeof(VaultItemSectionFieldValueConverter))]
+        [JsonProperty("v")]
         public readonly string Value;
+
+        [JsonProperty("k")]
+        public readonly string Kind;
+
+        [JsonProperty("a")]
+        public readonly VaultItemFieldAttributes Attributes;
+    }
+
+    internal class VaultItemFieldAttributes
+    {
+        [JsonProperty("guarded")]
+        public readonly string Guarded;
+
+        [JsonProperty("sshKeyAttributes")]
+        public readonly SshKeyAttributes SshKey;
+    }
+
+    internal class SshKeyAttributes
+    {
+        [JsonProperty("privateKey")]
+        public readonly string PrivateKey;
+
+        [JsonProperty("publicKey")]
+        public readonly string PublicKey;
+
+        [JsonProperty("fingerprint")]
+        public readonly string Fingerprint;
+
+        [JsonProperty("keyType")]
+        public readonly SshKeyType KeyType;
+    }
+
+    internal class SshKeyType
+    {
+        [JsonProperty("t")]
+        public readonly string Type;
+
+        [JsonProperty("c")]
+        public readonly int Bits;
+    }
+
+    // The "v" value could be practically anything. We are only interested in the string values.
+    // The rest is simply converted to JSON as a fallback.
+    internal class VaultItemSectionFieldValueConverter : JsonConverter<string>
+    {
+        public override string ReadJson(JsonReader reader, Type objectType, string existingValue, bool hasExistingValue, JsonSerializer serializer)
+        {
+            var token = JToken.Load(reader);
+            return token.Type switch
+            {
+                JTokenType.String => token.Value<string>(),
+                _ => token.ToString(Formatting.None),
+            };
+        }
+
+        public override void WriteJson(JsonWriter writer, string value, JsonSerializer serializer) => throw new NotImplementedException();
     }
 
     internal class AForB
@@ -395,5 +465,26 @@ namespace PasswordManagerAccess.OnePassword.Response
 
         [JsonProperty("userB", Required = Required.Always)]
         public readonly string B;
+    }
+
+    internal class ServiceAccountToken
+    {
+        [JsonProperty("signInAddress")]
+        public readonly string Domain;
+
+        [JsonProperty("email")]
+        public readonly string Username;
+
+        [JsonProperty("secretKey")]
+        public readonly string AccountKey;
+
+        [JsonProperty("deviceUuid")]
+        public readonly string DeviceUuid;
+
+        [JsonProperty("srpX")]
+        public readonly string SrpX;
+
+        [JsonProperty("muk")]
+        public readonly AesKey MasterUnlockKey;
     }
 }

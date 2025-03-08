@@ -1,15 +1,16 @@
 // Copyright (C) Dmitry Yakimenko (detunized@gmail.com).
 // Licensed under the terms of the MIT license. See LICENCE for details.
 
+using System.Linq;
 using System.Security.Cryptography;
 using PasswordManagerAccess.Common;
 
 namespace PasswordManagerAccess.OnePassword
 {
-    internal class RsaKey: IDecryptor
+    internal class RsaKey : IDecryptor
     {
         public const string ContainerType = "b5+jwk+json";
-        public const string EncryptionScheme = "RSA-OAEP";
+        public static readonly string[] EncryptionSchemes = { OaepSha1, OaepSha256 };
 
         public readonly string Id;
         public readonly RSAParameters Parameters;
@@ -42,11 +43,19 @@ namespace PasswordManagerAccess.OnePassword
             if (e.KeyId != Id)
                 throw new InternalErrorException("Mismatching key id");
 
-            if (e.Scheme != EncryptionScheme)
-                throw new InternalErrorException(
-                    $"Invalid encryption scheme '{e.Scheme}', expected '{EncryptionScheme}'");
-
-            return Crypto.DecryptRsaSha1(e.Ciphertext, Parameters);
+            return e.Scheme switch
+            {
+                OaepSha1 => Crypto.DecryptRsaSha1(e.Ciphertext, Parameters),
+                OaepSha256 => Crypto.DecryptRsaSha256(e.Ciphertext, Parameters),
+                _ => throw new InternalErrorException($"Invalid encryption scheme '{e.Scheme}'"),
+            };
         }
+
+        //
+        // Private
+        //
+
+        private const string OaepSha1 = "RSA-OAEP";
+        private const string OaepSha256 = "RSA-OAEP-256";
     }
 }

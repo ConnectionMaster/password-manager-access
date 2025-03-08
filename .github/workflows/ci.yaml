@@ -3,12 +3,12 @@ name: .NET build, test and release
 on:
   push:
     branches:
-      - master
+      - '*'
     tags:
       - v*
   pull_request:
     branches:
-      - master
+      - '*'
 
 jobs:
   Build:
@@ -16,35 +16,53 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        framework: [net6]
-        include:
-          - os: windows-latest
-            framework: net48
+        dotnet: ['6.0', '8.0']
 
     runs-on: ${{ matrix.os }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
         with:
-          fetch-depth: 0
+          dotnet-version: |
+            ${{ matrix.dotnet }}.x
+            8.0.x
+
+      - name: Install MAUI workflow
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        run: dotnet workload install maui-tizen
 
       - name: .NET info
         run: |
-            dotnet --info
-            dotnet --list-sdks
-            dotnet --list-runtimes
+          dotnet --info
+          dotnet --list-sdks
+          dotnet --list-runtimes
 
-      - name: Test ${{ matrix.framework }}
-        run: dotnet test --configuration Release --framework ${{ matrix.framework }} --logger "trx;LogFileName=test-results.trx"
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      - name: Restore dependencies
+        run: dotnet restore --property TargetFramework=net${{ matrix.dotnet }}
+
+      - name: Test .NET ${{ matrix.dotnet }}
+        run: dotnet test --no-restore --configuration Release --framework net${{ matrix.dotnet }} --logger "trx;LogFileName=test-results.trx"
 
       - name: Test Report
         uses: dorny/test-reporter@v1
-        if: success() || failure()
+        if: always()
         with:
-          name: Test (${{ matrix.os }}, ${{ matrix.framework }})
+          name: Test (${{ matrix.os }}, net${{ matrix.dotnet }})
           path: test/TestResults/test-results.trx
           reporter: dotnet-trx
+          fail-on-error: true
 
   Release:
     needs: Build

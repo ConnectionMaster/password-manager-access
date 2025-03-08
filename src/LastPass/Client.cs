@@ -5,40 +5,85 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Security.Cryptography;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Xml;
 using System.Xml.Linq;
 using System.Xml.XPath;
+using OneOf;
 using PasswordManagerAccess.Common;
 using PasswordManagerAccess.Duo;
 using PasswordManagerAccess.LastPass.Ui;
 
 namespace PasswordManagerAccess.LastPass
 {
-    internal static class Client
+    internal static partial class Client
     {
-        public static Account[] OpenVault(string username,
-                                          string password,
-                                          ClientInfo clientInfo,
-                                          IUi ui,
-                                          IRestTransport transport,
-                                          ParserOptions options)
+        public const int MaxOtpAttempts = 3;
+        public const int DefaultIterationCount = 100_100;
+
+        public static async Task<Account[]> OpenVault(
+            string username,
+            string password,
+            ClientInfo clientInfo,
+            IAsyncUi ui,
+            IRestTransport transport,
+            ParserOptions options,
+            ISecureLogger logger, // can be null
+            CancellationToken cancellationToken
+        )
         {
-            var lowerCaseUsername = username.ToLowerInvariant();
-            var (session, rest) = Login(lowerCaseUsername, password, clientInfo, ui, transport);
+            // We allow the logger to be null for optimization purposes
+            var tagLog = options.LoggingEnabled ? new TaggedLogger("LastPass", logger ?? new NullLogger()) : null;
+
+            // Add filters to the log
+            if (tagLog != null)
+            {
+                tagLog.AddFilter(username);
+                tagLog.AddFilter(username.EncodeUri());
+                tagLog.AddFilter(username.EncodeUriData());
+                tagLog.AddFilter(password);
+                tagLog.AddFilter(password.EncodeUri());
+                tagLog.AddFilter(password.EncodeUriData());
+                tagLog.AddFilter(clientInfo.Id);
+                tagLog.AddRegexFilter(@"(?<=hash=)[a-z0-9]+");
+                tagLog.AddRegexFilter(@"(?<=PHPSESSID=)[a-z0-9]+");
+                tagLog.AddRegexFilter(@"(?<=sessionid=)"".*?""");
+
+                // TODO: Move to Duo
+                tagLog.AddRegexFilter(@"(?<=duo_(session|private)_token=)"".*?""");
+                tagLog.AddRegexFilter(@"(?<=Cookie: sid\|)[a-z0-9-]="".*?""");
+                tagLog.AddRegexFilter(@"(?<=\bsid=)[a-z0-9%-]+");
+                tagLog.AddRegexFilter(@"(?<=TX\|)[a-z0-9|:-]+");
+                tagLog.AddRegexFilter(@"(?<=eyJ0eXAiOiJKV1QiL.*?\.)[a-z0-9.%_/+-]+"); // JWT tokens
+            }
+
             try
             {
-                var blob = DownloadVault(session, rest);
-                var key = Util.DeriveKey(lowerCaseUsername, password, session.KeyIterationCount);
+                var lowerCaseUsername = username.ToLowerInvariant();
+                var (state, rest) = await Login(lowerCaseUsername, password, clientInfo, ui, transport, tagLog, cancellationToken)
+                    .ConfigureAwait(false);
+                try
+                {
+                    var blob = await DownloadVault(state, rest, cancellationToken).ConfigureAwait(false);
 
-                var privateKey = new RSAParameters();
-                if (!session.EncryptedPrivateKey.IsNullOrEmpty())
-                    privateKey = Parser.ParseEncryptedPrivateKey(session.EncryptedPrivateKey, key);
+                    var privateKey = new RSAParameters();
+                    if (!state.Session.EncryptedPrivateKey.IsNullOrEmpty())
+                        privateKey = Parser.ParseEncryptedPrivateKey(state.Session.EncryptedPrivateKey, state.EncryptionKey);
 
-                return ParseVault(blob, key, privateKey, options);
+                    return ParseVault(blob, state.EncryptionKey, privateKey, options);
+                }
+                finally
+                {
+                    await Logout(state, rest, cancellationToken).ConfigureAwait(false);
+                }
             }
-            finally
+            catch (BaseException e)
             {
-                Logout(session, rest);
+                if (tagLog != null)
+                    e.Log = tagLog.Entries;
+
+                throw;
             }
         }
 
@@ -46,13 +91,26 @@ namespace PasswordManagerAccess.LastPass
         // Internal
         //
 
-        internal static (Session, RestClient) Login(string username,
-                                                    string password,
-                                                    ClientInfo clientInfo,
-                                                    IUi ui,
-                                                    IRestTransport transport)
+        internal record LoginState(Session Session, Platform Platform, byte[] EncryptionKey) { }
+
+        internal static async Task<(LoginState, RestClient)> Login(
+            string username,
+            string password,
+            ClientInfo clientInfo,
+            IAsyncUi ui,
+            IRestTransport transport,
+            ISimpleLogger logger,
+            CancellationToken cancellationToken
+        )
         {
-            var rest = new RestClient(transport, "https://lastpass.com");
+            var rest = new RestClient(transport, "https://lastpass.com", logger: logger, useSystemJson: true);
+            var extraParameters = new Dictionary<string, object>();
+
+            // 0. Check if we need to do SSO login
+            var loginInfo = await GetLoginInfo(username, rest, cancellationToken).ConfigureAwait(false);
+            if (loginInfo.LoginType != Model.LoginType.Regular)
+                (password, extraParameters) = await PerformSsoLogin(username, loginInfo, clientInfo, ui, rest, cancellationToken)
+                    .ConfigureAwait(false);
 
             // 1. First we need to request PBKDF2 key iteration count.
             //
@@ -64,188 +122,315 @@ namespace PasswordManagerAccess.LastPass
             // So we just went back a few years to the original way LastPass used to handle the iterations.
             // Namely, submit the default value and if it fails, the error would contain the correct value:
             // <response><error iterations="5000" /></response>
-            var keyIterationCount = 100100;
+            var keyIterationCount = DefaultIterationCount;
 
-            XDocument response = null;
-            Session session = null;
+            var changedIterationCount = false;
+            var changedServer = false;
+            var forceMfaMethod = MfaMethod.None;
 
-            // We have a maximum of 3 retries in case we need to try again with the correct domain and/or
-            // the number of KDF iterations the second/third time around.
-            for (var i = 0; i < 3; i++)
+            while (true)
             {
+                var key = Util.DeriveKey(username, password, keyIterationCount);
+                var keyHash = Util.DeriveKeyHash(username, password, keyIterationCount).ToHex();
+
                 // 2. Knowing the iterations count we can hash the password and log in.
                 //    On the first attempt simply with the username and password.
-                response = PerformSingleLoginRequest(username,
-                                                     password,
-                                                     keyIterationCount,
-                                                     new Dictionary<string, object>(),
-                                                     clientInfo,
-                                                     rest);
+                var response = await PerformSingleLoginRequest(
+                        username,
+                        keyHash,
+                        keyIterationCount,
+                        forceMfaMethod,
+                        false,
+                        extraParameters,
+                        clientInfo,
+                        rest,
+                        cancellationToken
+                    )
+                    .ConfigureAwait(false);
 
-                session = ExtractSessionFromLoginResponse(response, keyIterationCount, clientInfo);
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var session = ExtractSessionFromLoginResponse(response);
                 if (session != null)
-                    return (session, rest);
+                    // Set the key
+                    return (new LoginState(session, clientInfo.Platform, key), rest);
 
-                // It's possible we're being redirected to another region.
+                // 3. It's possible we're being redirected to another region.
                 var server = GetOptionalErrorAttribute(response, "server");
                 if (!server.IsNullOrEmpty())
                 {
+                    // Prevent infinite loops
+                    if (changedServer)
+                        throw new InternalErrorException("Trying to change server too many times");
+
+                    // Change the server and retry
                     rest = new RestClient(transport, "https://" + server);
+                    changedServer = true;
                     continue;
                 }
 
-                // It's possible for the request above to come back with the correct iteration count.
-                // In this case we have to parse and repeat.
+                // 4. It's possible for the request above to come back with the correct iteration count.
+                //    In this case we have to parse and repeat.
                 var correctIterationCount = GetOptionalErrorAttribute(response, "iterations");
-                if (correctIterationCount == null)
-                    break;
+                if (!correctIterationCount.IsNullOrEmpty())
+                {
+                    // Prevent infinite loops
+                    if (changedIterationCount)
+                        throw new InternalErrorException("Trying to change iteration count too many times");
 
-                if (!int.TryParse(correctIterationCount, out keyIterationCount))
-                    throw new InternalErrorException($"Failed to parse the iteration count, expected an integer value '{correctIterationCount}'");
+                    if (!int.TryParse(correctIterationCount, out keyIterationCount))
+                        throw new InternalErrorException($"Failed to parse the iteration count, expected an integer value '{correctIterationCount}'");
+
+                    // Change the iteration count and retry
+                    changedIterationCount = true;
+                    continue;
+                }
+
+                // 5. The simple login failed. This is usually due to some error, invalid credentials or
+                //    a multifactor authentication being enabled.
+                var cause = GetOptionalErrorAttribute(response, "cause");
+                if (cause == null)
+                    throw MakeLoginError(response);
+
+                var enabledMfaMethods = ParseAvailableMfaMethods(response);
+                OneOf<Session, MfaMethod> mfaLoginResult;
+
+                // 6.1. One-time-password is required
+                if (KnownOtpMethods.TryGetValue(cause, out var otpMethod))
+                {
+                    mfaLoginResult = await LoginWithOtp(
+                            username,
+                            keyHash,
+                            keyIterationCount,
+                            otpMethod,
+                            enabledMfaMethods.Where(x => x != otpMethod).ToArray(),
+                            clientInfo,
+                            ui,
+                            rest,
+                            cancellationToken
+                        )
+                        .ConfigureAwait(false);
+
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
+                // 6.2. Some out-of-bound authentication is enabled. This might or might not require
+                //      additional input from the user depending on the method.
+                else if (cause == "outofbandrequired")
+                {
+                    var allAttributes = GetAllErrorAttributes(response);
+                    if (!allAttributes.TryGetValue("outofbandtype", out var oobMethodName))
+                        throw new InternalErrorException("Out of band method is not specified");
+
+                    if (!KnownMfaMethods.TryGetValue(oobMethodName, out var oobMethod))
+                        throw new InternalErrorException($"Unsupported out of band method: {oobMethodName}");
+
+                    mfaLoginResult = await LoginWithOob(
+                            username,
+                            keyHash,
+                            keyIterationCount,
+                            allAttributes,
+                            oobMethod,
+                            enabledMfaMethods.Where(x => x != oobMethod).ToArray(),
+                            clientInfo,
+                            ui,
+                            rest,
+                            logger,
+                            cancellationToken
+                        )
+                        .ConfigureAwait(false);
+
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
+                else
+                {
+                    throw MakeLoginError(response);
+                }
+
+                switch (mfaLoginResult.Value)
+                {
+                    // All good, we got a valid session
+                    case Session s:
+                        return (new LoginState(s, clientInfo.Platform, key), rest);
+                    case MfaMethod mfaMethod:
+                        // We need to retry the login with a different MFA method
+                        forceMfaMethod = mfaMethod;
+                        continue;
+                }
+
+                throw new InternalErrorException("Logic error: should never get here");
             }
-
-            // 3. The simple login failed. This is usually due to some error, invalid credentials or
-            //    a multifactor authentication being enabled.
-            var cause = GetOptionalErrorAttribute(response, "cause");
-            if (cause == null)
-                throw MakeLoginError(response);
-
-            // 3.1. One-time-password is required
-            if (KnownOtpMethods.TryGetValue(cause, out var otpMethod))
-                session = LoginWithOtp(username,
-                                       password,
-                                       keyIterationCount,
-                                       otpMethod,
-                                       clientInfo,
-                                       ui,
-                                       rest);
-
-            // 3.2. Some out-of-bound authentication is enabled. This does not require any
-            //      additional input from the user.
-            else if (cause == "outofbandrequired")
-                session = LoginWithOob(username,
-                                       password,
-                                       keyIterationCount,
-                                       GetAllErrorAttributes(response),
-                                       clientInfo,
-                                       ui,
-                                       rest);
-
-            // Nothing worked
-            if (session == null)
-                throw MakeLoginError(response);
-
-            // All good
-            return (session, rest);
         }
 
-        internal static XDocument PerformSingleLoginRequest(string username,
-                                                            string password,
-                                                            int keyIterationCount,
-                                                            Dictionary<string, object> extraParameters,
-                                                            ClientInfo clientInfo,
-                                                            RestClient rest)
+        internal static async Task<XDocument> PerformSingleLoginRequest(
+            string username,
+            string keyHash,
+            int keyIterationCount,
+            MfaMethod forceMfaMethod,
+            bool rememberMe,
+            Dictionary<string, object> extraParameters,
+            ClientInfo clientInfo,
+            RestClient rest,
+            CancellationToken cancellationToken
+        )
         {
             var parameters = new Dictionary<string, object>
             {
                 ["method"] = PlatformToUserAgent[clientInfo.Platform],
                 ["xml"] = "2",
                 ["username"] = username,
-                ["hash"] = Util.DeriveKeyHash(username, password, keyIterationCount).ToHex(),
+                ["hash"] = keyHash,
                 ["iterations"] = keyIterationCount,
                 ["includeprivatekeyenc"] = "1",
                 ["outofbandsupported"] = "1",
                 ["uuid"] = clientInfo.Id,
-                ["trustlabel"] = clientInfo.Description, // TODO: Test against the real server if it's ok to send this every time!
             };
+
+            if (rememberMe)
+            {
+                parameters["trustlabel"] = clientInfo.Description;
+                parameters["canexpire"] = "1";
+                parameters["cansetuuid"] = "0";
+            }
+
+            if (forceMfaMethod != MfaMethod.None)
+                parameters["provider"] = GetMfaMethodName(forceMfaMethod);
 
             foreach (var kv in extraParameters)
                 parameters[kv.Key] = kv.Value;
 
-            var response = rest.PostForm("login.php", parameters);
+            var response = await rest.PostFormAsync("login.php", parameters, cancellationToken).ConfigureAwait(false);
             if (response.IsSuccessful)
                 return ParseXml(response);
 
             throw MakeError(response);
         }
 
-        internal enum OtpMethod
-        {
-            GoogleAuth,
-            MicrosoftAuth,
-            Yubikey,
-        }
-
         // Returns a valid session or throws
-        internal static Session LoginWithOtp(string username,
-                                             string password,
-                                             int keyIterationCount,
-                                             OtpMethod method,
-                                             ClientInfo clientInfo,
-                                             IUi ui,
-                                             RestClient rest)
+        internal static async Task<OneOf<Session, MfaMethod>> LoginWithOtp(
+            string username,
+            string keyHash,
+            int keyIterationCount,
+            MfaMethod method,
+            MfaMethod[] otherMethods,
+            ClientInfo clientInfo,
+            IAsyncUi ui,
+            RestClient rest,
+            CancellationToken cancellationToken
+        )
         {
-            var passcode = method switch
+            for (var attempt = 0; ; attempt++)
             {
-                OtpMethod.GoogleAuth => ui.ProvideGoogleAuthPasscode(),
-                OtpMethod.MicrosoftAuth => ui.ProvideMicrosoftAuthPasscode(),
-                OtpMethod.Yubikey => ui.ProvideYubikeyPasscode(),
-                _ => throw new InternalErrorException("Invalid OTP method")
-            };
+                var otpResult = method switch
+                {
+                    MfaMethod.GoogleAuthenticator => await ui.ProvideGoogleAuthPasscode(attempt, otherMethods, cancellationToken)
+                        .ConfigureAwait(false),
+                    MfaMethod.MicrosoftAuthenticator => await ui.ProvideMicrosoftAuthPasscode(attempt, otherMethods, cancellationToken)
+                        .ConfigureAwait(false),
+                    MfaMethod.YubikeyOtp => await ui.ProvideYubikeyPasscode(attempt, otherMethods, cancellationToken).ConfigureAwait(false),
+                    _ => throw new InternalErrorException("Invalid OTP method"),
+                };
 
-            if (passcode == OtpResult.Cancel)
-                throw new CanceledMultiFactorException("Second factor step is canceled by the user");
+                switch (otpResult.Value)
+                {
+                    case MfaMethod mfa:
+                        return mfa;
+                    case Canceled:
+                        throw new CanceledMultiFactorException("Second factor step is canceled by the user");
+                }
 
-            var response = PerformSingleLoginRequest(username,
-                                                     password,
-                                                     keyIterationCount,
-                                                     new Dictionary<string, object> {["otp"] = passcode.Passcode},
-                                                     clientInfo,
-                                                     rest);
+                // User provided a passcode
+                var otp = otpResult.AsT0;
 
-            var session = ExtractSessionFromLoginResponse(response, keyIterationCount, clientInfo);
-            if (session == null)
-                throw MakeLoginError(response);
+                var response = await PerformSingleLoginRequest(
+                        username,
+                        keyHash,
+                        keyIterationCount,
+                        method,
+                        otp.RememberMe,
+                        new Dictionary<string, object> { ["otp"] = otp.Passcode },
+                        clientInfo,
+                        rest,
+                        cancellationToken
+                    )
+                    .ConfigureAwait(false);
 
-            if (passcode.RememberMe)
-                MarkDeviceAsTrusted(session, clientInfo, rest);
+                var session = ExtractSessionFromLoginResponse(response);
+                if (session != null)
+                {
+                    if (otp.RememberMe)
+                        await MarkDeviceAsTrusted(session, clientInfo, rest, cancellationToken).ConfigureAwait(false);
 
-            return session;
+                    return session;
+                }
+
+                var error = MakeLoginError(response);
+                if (error is BadMultiFactorException && attempt < MaxOtpAttempts - 1)
+                    continue;
+
+                throw error;
+            }
         }
 
         // Returns a valid session or throws
-        internal static Session LoginWithOob(string username,
-                                             string password,
-                                             int keyIterationCount,
-                                             Dictionary<string, string> parameters,
-                                             ClientInfo clientInfo,
-                                             IUi ui,
-                                             RestClient rest)
+        internal static async Task<OneOf<Session, MfaMethod>> LoginWithOob(
+            string username,
+            string keyHash,
+            int keyIterationCount,
+            Dictionary<string, string> parameters,
+            MfaMethod method,
+            MfaMethod[] otherMethods,
+            ClientInfo clientInfo,
+            IAsyncUi ui,
+            RestClient rest,
+            ISimpleLogger logger,
+            CancellationToken cancellationToken
+        )
         {
-            var answer = ApproveOob(username, parameters, ui, rest);
+            var oobResult = await ApproveOob(username, parameters, method, otherMethods, ui, rest, logger, cancellationToken).ConfigureAwait(false);
 
-            if (answer == OobResult.Cancel)
-                throw new CanceledMultiFactorException("Out of band step is canceled by the user");
+            // The user chose a different MFA method
+            if (oobResult.Value is MfaMethod mfa)
+                return mfa;
 
-            var extraParameters = new Dictionary<string, object>(1);
-            if (answer.WaitForOutOfBand)
-                extraParameters["outofbandrequest"] = 1;
-            else
-                extraParameters["otp"] = answer.Passcode;
+            var rememberMe = false;
+            var extraParameters = new Dictionary<string, object>();
+            oobResult.Switch(
+                otp =>
+                {
+                    extraParameters = extraParameters.MergeCopy(otp.Extras);
+                    extraParameters["otp"] = otp.Otp.Passcode;
+                    rememberMe = otp.Otp.RememberMe;
+                },
+                waitForOob =>
+                {
+                    extraParameters["outofbandrequest"] = 1;
+                    rememberMe = waitForOob.RememberMe;
+                },
+                _ =>
+                {
+                    // Do nothing, already handled above
+                }
+            );
 
             Session session;
-            for (;;)
+            while (true)
             {
                 // In case of the OOB auth the server doesn't respond instantly. This works more like a long poll.
                 // The server times out in about 10 seconds so there's no need to back off.
-                var response = PerformSingleLoginRequest(username,
-                                                         password,
-                                                         keyIterationCount,
-                                                         extraParameters,
-                                                         clientInfo,
-                                                         rest);
+                var response = await PerformSingleLoginRequest(
+                        username,
+                        keyHash,
+                        keyIterationCount,
+                        method,
+                        rememberMe,
+                        extraParameters,
+                        clientInfo,
+                        rest,
+                        cancellationToken
+                    )
+                    .ConfigureAwait(false);
 
-                session = ExtractSessionFromLoginResponse(response, keyIterationCount, clientInfo);
+                session = ExtractSessionFromLoginResponse(response);
                 if (session != null)
                     break;
 
@@ -257,43 +442,64 @@ namespace PasswordManagerAccess.LastPass
                 extraParameters["outofbandretryid"] = GetErrorAttribute(response, "retryid");
             }
 
-            if (answer.RememberMe)
-                MarkDeviceAsTrusted(session, clientInfo, rest);
+            if (rememberMe)
+                await MarkDeviceAsTrusted(session, clientInfo, rest, cancellationToken).ConfigureAwait(false);
 
             return session;
         }
 
-        internal static OobResult ApproveOob(string username,
-                                             Dictionary<string, string> parameters,
-                                             IUi ui,
-                                             RestClient rest)
+        internal record OtpWithExtras(Otp Otp, Dictionary<string, object> Extras)
         {
-            if (!parameters.TryGetValue("outofbandtype", out var method))
-                throw new InternalErrorException("Out of band method is not specified");
+            public OtpWithExtras(Otp otp)
+                : this(otp, []) { }
+        }
 
-            return method switch
+        internal record RedirectToV1;
+
+        internal static async Task<OneOf<OtpWithExtras, WaitForOutOfBand, MfaMethod>> ApproveOob(
+            string username,
+            Dictionary<string, string> parameters,
+            MfaMethod method,
+            MfaMethod[] otherMethods,
+            IAsyncUi ui,
+            RestClient rest,
+            ISimpleLogger logger,
+            CancellationToken cancellationToken
+        )
+        {
+            switch (method)
             {
-                "lastpassauth" => ui.ApproveLastPassAuth(),
-                "duo" => ApproveDuo(username, parameters, ui, rest),
-                "salesforcehash" => ui.ApproveSalesforceAuth(),
-                _ => throw new UnsupportedFeatureException($"Out of band method '{method}' is not supported")
-            };
+                case MfaMethod.Duo:
+                    if (parameters.GetOrDefault("preferduowebsdk", "") != "1")
+                        throw new UnsupportedFeatureException("Duo is only supported via Duo Web SDK");
+
+                    var duoResult = await ApproveDuoWebSdk(username, parameters, otherMethods, ui, rest, logger, cancellationToken)
+                        .ConfigureAwait(false);
+                    return duoResult.Match<OneOf<OtpWithExtras, WaitForOutOfBand, MfaMethod>>(otp => otp, mfa => mfa);
+
+                case MfaMethod.LastPassAuthenticator:
+                    var lpaResult = await ui.ApproveLastPassAuth(0, otherMethods, cancellationToken).ConfigureAwait(false);
+                    return lpaResult.Match<OneOf<OtpWithExtras, WaitForOutOfBand, MfaMethod>>(
+                        otp => new OtpWithExtras(otp),
+                        waitForOob => waitForOob,
+                        mfa => mfa,
+                        cancelled => throw new CanceledMultiFactorException("Out of band step is canceled by the user")
+                    );
+
+                default:
+                    throw new UnsupportedFeatureException($"Out of band method '{method}' is not supported");
+            }
         }
 
-        internal static OobResult ApproveDuo(string username,
-                                             Dictionary<string, string> parameters,
-                                             IUi ui,
-                                             RestClient rest)
-        {
-            return parameters.GetOrDefault("preferduowebsdk", "") == "1"
-                ? ApproveDuoWebSdk(username, parameters, ui, rest)
-                : ui.ApproveDuo();
-        }
-
-        internal static OobResult ApproveDuoWebSdk(string username,
-                                                   Dictionary<string, string> parameters,
-                                                   IUi ui,
-                                                   RestClient rest)
+        internal static async Task<OneOf<OtpWithExtras, MfaMethod>> ApproveDuoWebSdk(
+            string username,
+            Dictionary<string, string> parameters,
+            MfaMethod[] otherMethods,
+            IAsyncUi ui,
+            RestClient rest,
+            ISimpleLogger logger,
+            CancellationToken cancellationToken
+        )
         {
             string GetParam(string name)
             {
@@ -303,26 +509,166 @@ namespace PasswordManagerAccess.LastPass
                 throw new InternalErrorException($"Invalid response: '{name}' parameter not found");
             }
 
-            var host = GetParam("duo_host");
-            var signature = GetParam("duo_signature");
-            var salt = GetParam("duo_bytes");
+            // See if V4 is enabled
+            if (parameters.TryGetValue("duo_authentication_url", out var url))
+            {
+                var v4Result = await ApproveDuoWebSdkV4(
+                        username: username,
+                        url: url,
+                        sessionToken: GetParam("duo_session_token"),
+                        privateToken: GetParam("duo_private_token"),
+                        otherMethods: otherMethods,
+                        ui: ui,
+                        rest: rest,
+                        logger: logger,
+                        cancellationToken: cancellationToken
+                    )
+                    .ConfigureAwait(false);
 
-            // Returns: AUTH|ZGV...Tcx|545...07b:APP|ZGV...TAx|145...09e
-            var result = DuoV1.Authenticate(host, signature, ui, rest.Transport);
-            if (result == null)
-                return OobResult.Cancel;
+                switch (v4Result.Value)
+                {
+                    case OtpWithExtras otp:
+                        return otp;
+                    case MfaMethod mfa:
+                        return mfa;
+                }
 
-            var passcode = ExchangeDuoSignatureForPasscode(username: username,
-                                                           signature: result.Passcode,
-                                                           salt: salt,
-                                                           rest: rest);
-            return OobResult.ContinueWithPasscode(passcode, result.RememberMe);
+                // Fallthrough to V1.
+            }
+
+            // Legacy Duo V1. Won't be available after September 2024.
+            var v1Result = await ApproveDuoWebSdkV1(
+                    username: username,
+                    host: GetParam("duo_host"),
+                    salt: GetParam("duo_bytes"),
+                    signature: GetParam("duo_signature"),
+                    otherMethods: otherMethods,
+                    ui: ui,
+                    rest: rest,
+                    logger: logger,
+                    cancellationToken: cancellationToken
+                )
+                .ConfigureAwait(false);
+
+            // Wrap OTP with empty extras
+            return v1Result.MapT0(otp => new OtpWithExtras(otp));
         }
 
-        internal static string ExchangeDuoSignatureForPasscode(string username,
-                                                               string signature,
-                                                               string salt,
-                                                               RestClient rest)
+        private static async Task<OneOf<Otp, MfaMethod>> ApproveDuoWebSdkV1(
+            string username,
+            string host,
+            string salt,
+            string signature,
+            MfaMethod[] otherMethods,
+            IAsyncUi ui,
+            RestClient rest,
+            ISimpleLogger logger,
+            CancellationToken cancellationToken
+        )
+        {
+            // 1. Do a normal Duo V1 first
+            // Allow the logger to be null for optimization purposes (saved a bunch of work in the RestClient code)
+            var duoLogger = logger == null ? null : new TaggedLogger("LastPass.DuoV1", logger);
+            var duoResult = await DuoV1
+                .AuthenticateAsync(host, signature, otherMethods, ui, rest.Transport, duoLogger, cancellationToken)
+                .ConfigureAwait(false);
+
+            switch (duoResult.Value)
+            {
+                case MfaMethod mfa:
+                    return mfa;
+                case DuoCancelled:
+                    throw new CanceledMultiFactorException("Duo V1 MFA step is canceled by the user");
+            }
+
+            var result = duoResult.AsT0;
+
+            // 2. Exchange the signature for a passcode
+            var passcode = await ExchangeDuoSignatureForPasscode(
+                    username: username,
+                    signature: result.Code,
+                    salt: salt,
+                    rest: rest,
+                    cancellationToken: cancellationToken
+                )
+                .ConfigureAwait(false);
+
+            return new Otp(passcode, result.RememberMe);
+        }
+
+        private static async Task<OneOf<OtpWithExtras, RedirectToV1, MfaMethod>> ApproveDuoWebSdkV4(
+            string username,
+            string url,
+            string sessionToken,
+            string privateToken,
+            MfaMethod[] otherMethods,
+            IAsyncUi ui,
+            RestClient rest,
+            ISimpleLogger logger,
+            CancellationToken cancellationToken
+        )
+        {
+            // 1. Do a normal Duo V4 first
+            // Allow the logger to be null for optimization purposes (saved a bunch of work in the RestClient code)
+            var duoLogger = logger == null ? null : new TaggedLogger("LastPass.DuoV4", logger);
+            var duoResult = await DuoV4.AuthenticateAsync(url, otherMethods, ui, rest.Transport, duoLogger, cancellationToken).ConfigureAwait(false);
+
+            switch (duoResult.Value)
+            {
+                // 2. Detect if we need to redirect to V1. This happens when the traditional prompt is enabled in the Duo
+                //    admin panel. The Duo URL looks the same for both the traditional prompt and the new universal one.
+                //    So we have no way of knowing this in advance. This only becomes evident after the first request to
+                //    the Duo API.
+                case DuoResult result when result == DuoResult.RedirectToV1:
+                    return new RedirectToV1();
+                case MfaMethod mfa:
+                    return mfa;
+                case DuoCancelled:
+                    throw new CanceledMultiFactorException("Duo V4 MFA step is canceled by the user");
+            }
+
+            // 3. Since LastPass is special we have to jump through some hoops to get this finalized
+            //    Even though Duo already returned us the code, we need to poll LastPass to get a
+            //    custom one-time token to submit it with the login request later.
+            var lmiRest = new RestClient(rest.Transport, "https://lastpass.com/lmiapi/duo");
+            var response = await lmiRest
+                .PostJsonAsync<Model.DuoStatus>(
+                    "status",
+                    new Dictionary<string, object>
+                    {
+                        ["userName"] = username,
+                        ["sessionToken"] = sessionToken,
+                        ["privateToken"] = privateToken,
+                    },
+                    cancellationToken
+                )
+                .ConfigureAwait(false);
+            if (!response.IsSuccessful)
+                throw MakeError(response);
+
+            var status = response.Data;
+            if (status.Status == "allowed" && !status.OneTimeToken.IsNullOrEmpty())
+                return new OtpWithExtras(
+                    new Otp("duoWebSdkV4", duoResult.AsT0.RememberMe),
+                    new Dictionary<string, object>
+                    {
+                        ["provider"] = "duo",
+                        ["duoOneTimeToken"] = status.OneTimeToken,
+                        ["duoSessionToken"] = sessionToken,
+                        ["duoPrivateToken"] = privateToken,
+                    }
+                );
+
+            throw new InternalErrorException("Failed to retrieve Duo one time token");
+        }
+
+        internal static async Task<string> ExchangeDuoSignatureForPasscode(
+            string username,
+            string signature,
+            string salt,
+            RestClient rest,
+            CancellationToken cancellationToken
+        )
         {
             var parameters = new Dictionary<string, object>
             {
@@ -336,7 +682,7 @@ namespace PasswordManagerAccess.LastPass
                 ["sig_response"] = signature,
             };
 
-            var response = rest.PostForm("duo.php", parameters);
+            var response = await rest.PostFormAsync("duo.php", parameters, cancellationToken).ConfigureAwait(false);
             if (response.IsSuccessful)
                 return "checkduo" + ExtractDuoPasscodeFromDuoResponse(ParseXml(response));
 
@@ -352,31 +698,37 @@ namespace PasswordManagerAccess.LastPass
             return code;
         }
 
-        internal static void MarkDeviceAsTrusted(Session session, ClientInfo clientInfo, RestClient rest)
+        internal static async Task MarkDeviceAsTrusted(Session session, ClientInfo clientInfo, RestClient rest, CancellationToken cancellationToken)
         {
-            var response = rest.PostForm("trust.php",
-                                         new Dictionary<string, object>
-                                         {
-                                             ["uuid"] = clientInfo.Id,
-                                             ["trustlabel"] = clientInfo.Description,
-                                             ["token"] = session.Token,
-                                         },
-                                         cookies: GetSessionCookies(session));
+            var response = await rest.PostFormAsync(
+                    "trust.php",
+                    new Dictionary<string, object>
+                    {
+                        ["uuid"] = clientInfo.Id,
+                        ["trustlabel"] = clientInfo.Description,
+                        ["token"] = session.Token,
+                    },
+                    headers: RestClient.NoHeaders,
+                    cookies: GetSessionCookies(session),
+                    cancellationToken
+                )
+                .ConfigureAwait(false);
             if (response.IsSuccessful)
                 return;
 
             throw MakeError(response);
         }
 
-        internal static void Logout(Session session, RestClient rest)
+        internal static async Task Logout(LoginState state, RestClient rest, CancellationToken cancellationToken)
         {
-            var response = rest.PostForm("logout.php",
-                                         new Dictionary<string, object>
-                                         {
-                                             ["method"] = PlatformToUserAgent[session.Platform],
-                                             ["noredirect"] = 1,
-                                         },
-                                         cookies: GetSessionCookies(session));
+            var response = await rest.PostFormAsync(
+                    "logout.php",
+                    new Dictionary<string, object> { ["method"] = PlatformToUserAgent[state.Platform], ["noredirect"] = 1 },
+                    headers: RestClient.NoHeaders,
+                    cookies: GetSessionCookies(state.Session),
+                    cancellationToken
+                )
+                .ConfigureAwait(false);
 
             if (response.IsSuccessful)
                 return;
@@ -384,9 +736,15 @@ namespace PasswordManagerAccess.LastPass
             throw MakeError(response);
         }
 
-        internal static byte[] DownloadVault(Session session, RestClient rest)
+        internal static async Task<byte[]> DownloadVault(LoginState state, RestClient rest, CancellationToken cancellationToken)
         {
-            var response = rest.Get(GetVaultEndpoint(session.Platform), cookies: GetSessionCookies(session));
+            var response = await rest.GetAsync(
+                    GetVaultEndpoint(state.Platform),
+                    headers: RestClient.NoHeaders,
+                    cookies: GetSessionCookies(state.Session),
+                    cancellationToken
+                )
+                .ConfigureAwait(false);
             if (response.IsSuccessful)
                 return response.Content.Decode64();
 
@@ -400,7 +758,7 @@ namespace PasswordManagerAccess.LastPass
 
         internal static Dictionary<string, string> GetSessionCookies(Session session)
         {
-            return new Dictionary<string, string> {["PHPSESSID"] = Uri.EscapeDataString(session.Id)};
+            return new Dictionary<string, string> { ["PHPSESSID"] = Uri.EscapeDataString(session.Id) };
         }
 
         internal static XDocument ParseXml(RestResponse<string> response)
@@ -415,11 +773,19 @@ namespace PasswordManagerAccess.LastPass
             }
         }
 
-        internal static Session ExtractSessionFromLoginResponse(XDocument response,
-                                                                int keyIterationCount,
-                                                                ClientInfo clientInfo)
+        // TODO: Log unsupported methods, don't just ignore them
+        internal static MfaMethod[] ParseAvailableMfaMethods(XDocument response)
         {
-            var ok = response.XPathSelectElement("response/ok");
+            return (GetOptionalErrorAttribute(response, "enabled_providers") ?? "")
+                .Split(',')
+                .Select(x => KnownMfaMethods.GetValueOrDefault(x, MfaMethod.None))
+                .Where(x => x != MfaMethod.None)
+                .ToArray();
+        }
+
+        internal static Session ExtractSessionFromLoginResponse(XDocument response)
+        {
+            var ok = response.XPathSelectElement("//ok");
             if (ok == null)
                 return null;
 
@@ -431,11 +797,7 @@ namespace PasswordManagerAccess.LastPass
             if (token == null)
                 return null;
 
-            return new Session(sessionId.Value,
-                               keyIterationCount,
-                               token.Value,
-                               clientInfo.Platform,
-                               GetEncryptedPrivateKey(ok));
+            return new Session(sessionId.Value, token.Value, GetEncryptedPrivateKey(ok));
         }
 
         internal static string GetEncryptedPrivateKey(XElement ok)
@@ -461,44 +823,32 @@ namespace PasswordManagerAccess.LastPass
 
         internal static string GetOptionalErrorAttribute(XDocument response, string name)
         {
-            return response
-                .XPathSelectElement("response/error")?
-                .Attribute(name)?
-                .Value;
+            return response.XPathSelectElement("response/error")?.Attribute(name)?.Value;
         }
 
         internal static Dictionary<string, string> GetAllErrorAttributes(XDocument response)
         {
-            return response
-                .XPathSelectElement("response/error")?
-                .Attributes()
-                .ToDictionary(x => x.Name.LocalName, x => x.Value);
+            return response.XPathSelectElement("response/error")?.Attributes().ToDictionary(x => x.Name.LocalName, x => x.Value);
         }
 
         internal static Account[] ParseVault(byte[] blob, byte[] encryptionKey, RSAParameters privateKey, ParserOptions options)
         {
-            return blob.Open(
-                reader =>
-                {
-                    var chunks = Parser.ExtractChunks(reader);
-                    if (!IsComplete(chunks))
-                        throw new InternalErrorException("Blob is truncated or corrupted");
+            return blob.Open(reader =>
+            {
+                var chunks = Parser.ExtractChunks(reader);
+                if (!IsComplete(chunks))
+                    throw new InternalErrorException("Blob is truncated or corrupted");
 
-                    return ParseAccounts(chunks, encryptionKey, privateKey, options);
-                });
+                return ParseAccounts(chunks, encryptionKey, privateKey, options);
+            });
         }
 
         internal static bool IsComplete(List<Parser.Chunk> chunks)
         {
-            return chunks.Count > 0 &&
-                   chunks.Last().Id == "ENDM" &&
-                   chunks.Last().Payload.SequenceEqual("OK".ToBytes());
+            return chunks.Count > 0 && chunks.Last().Id == "ENDM" && chunks.Last().Payload.SequenceEqual("OK".ToBytes());
         }
 
-        internal static Account[] ParseAccounts(List<Parser.Chunk> chunks,
-                                                byte[] encryptionKey,
-                                                RSAParameters privateKey,
-                                                ParserOptions options)
+        internal static Account[] ParseAccounts(List<Parser.Chunk> chunks, byte[] encryptionKey, RSAParameters privateKey, ParserOptions options)
         {
             var accounts = new List<Account>(chunks.Count(i => i.Id == "ACCT"));
             SharedFolder folder = null;
@@ -507,22 +857,34 @@ namespace PasswordManagerAccess.LastPass
             {
                 switch (chunk.Id)
                 {
-                case "ACCT":
-                    var account = Parser.Parse_ACCT(chunk,
-                                                    folder == null ? encryptionKey : folder.EncryptionKey,
-                                                    folder,
-                                                    options);
+                    case "ACCT":
+                        var account = Parser.Parse_ACCT(chunk, folder == null ? encryptionKey : folder.EncryptionKey, folder, options);
 
-                    if (account != null)
-                        accounts.Add(account);
-                    break;
-                case "SHAR":
-                    folder = Parser.Parse_SHAR(chunk, encryptionKey, privateKey);
-                    break;
+                        if (account != null)
+                            accounts.Add(account);
+                        break;
+                    case "SHAR":
+                        folder = Parser.Parse_SHAR(chunk, encryptionKey, privateKey);
+                        break;
                 }
             }
 
             return accounts.ToArray();
+        }
+
+        internal static string GetMfaMethodName(MfaMethod method)
+        {
+            return method switch
+            {
+                MfaMethod.GoogleAuthenticator => "googleauth",
+                MfaMethod.MicrosoftAuthenticator => "microsoftauth",
+                MfaMethod.YubikeyOtp => "yubikey",
+
+                MfaMethod.Duo => "duo",
+                MfaMethod.LastPassAuthenticator => "lastpassauth",
+
+                _ => throw new UnsupportedFeatureException($"Unsupported MFA method: {method}"),
+            };
         }
 
         //
@@ -537,9 +899,7 @@ namespace PasswordManagerAccess.LastPass
             if (response.IsHttpOk)
                 return new InternalErrorException($"HTTP request to '{response.RequestUri}' failed", response.Error);
 
-            return new InternalErrorException(
-                $"HTTP request to '{response.RequestUri}' failed with status {response.StatusCode}",
-                response.Error);
+            return new InternalErrorException($"HTTP request to '{response.RequestUri}' failed with status {response.StatusCode}", response.Error);
         }
 
         internal static BaseException MakeLoginError(XDocument response)
@@ -558,22 +918,22 @@ namespace PasswordManagerAccess.LastPass
             {
                 switch (cause.Value)
                 {
-                case "unknownemail":
-                    return new BadCredentialsException("Invalid username");
+                    case "user_not_exists":
+                        return new BadCredentialsException("Invalid username");
 
-                case "unknownpassword":
-                    return new BadCredentialsException("Invalid password");
+                    case "password_invalid":
+                        return new BadCredentialsException("Invalid password");
 
-                case "googleauthfailed":
-                case "microsoftauthfailed":
-                case "otpfailed":
-                    return new BadMultiFactorException("Second factor code is incorrect");
+                    case "googleauthfailed":
+                    case "microsoftauthfailed":
+                    case "otpfailed":
+                        return new BadMultiFactorException("Second factor code is incorrect");
 
-                case "multifactorresponsefailed":
-                    return new BadMultiFactorException("Out of band authentication failed");
+                    case "multifactorresponsefailed":
+                        return new BadMultiFactorException("Out of band authentication failed");
 
-                default:
-                    return new InternalErrorException(message?.Value ?? cause.Value);
+                    default:
+                        return new InternalErrorException(message?.Value ?? cause.Value);
                 }
             }
 
@@ -595,11 +955,36 @@ namespace PasswordManagerAccess.LastPass
             [Platform.Mobile] = "android",
         };
 
-        private static readonly Dictionary<string, OtpMethod> KnownOtpMethods = new Dictionary<string, OtpMethod>
-        {
-            ["googleauthrequired"] = OtpMethod.GoogleAuth,
-            ["microsoftauthrequired"] = OtpMethod.MicrosoftAuth,
-            ["otprequired"] = OtpMethod.Yubikey,
-        };
+        private static readonly Dictionary<string, MfaMethod> KnownOtpMethods =
+            new()
+            {
+                ["googleauthrequired"] = MfaMethod.GoogleAuthenticator,
+                ["microsoftauthrequired"] = MfaMethod.MicrosoftAuthenticator,
+                ["otprequired"] = MfaMethod.YubikeyOtp,
+            };
+
+        private static readonly Dictionary<string, MfaMethod> KnownMfaMethods =
+            // All the methods found in the original JS code. Keep them commented out to make it easier
+            // to see what's missing.
+            new()
+            {
+                ["duo"] = MfaMethod.Duo,
+                ["googleauth"] = MfaMethod.GoogleAuthenticator,
+                // ["grid"] = ???,
+                ["lastpassauth"] = MfaMethod.LastPassAuthenticator,
+                // ["lastpassmfa"] = ???,
+                // ["multifactor"] = ???,
+                ["microsoftauth"] = MfaMethod.MicrosoftAuthenticator,
+                // ["salesforcehash"] = ???,
+                // ["secureauth"] = ???,
+                // ["securid"] = ???,
+                // ["sesame"] = ???,
+                // ["symantecvip"] = ???,
+                // ["toopher"] = ???,
+                // ["transakt"] = ???,
+                ["yubikey"] = MfaMethod.YubikeyOtp,
+                // ["no_multifactor"] = ???,
+                ["webauthn"] = MfaMethod.Fido2,
+            };
     }
 }

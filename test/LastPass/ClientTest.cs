@@ -3,8 +3,11 @@
 
 using System;
 using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Xml.Linq;
-using Moq;
+using FluentAssertions;
+using OneOf;
 using PasswordManagerAccess.Common;
 using PasswordManagerAccess.Duo;
 using PasswordManagerAccess.LastPass;
@@ -13,256 +16,371 @@ using Xunit;
 
 namespace PasswordManagerAccess.Test.LastPass
 {
-    public class ClientTest: TestBase
+    public class ClientTest : TestBase
     {
         // The general idea is to test as high level as possible even though it might get tedious.
         // This ensures that if/when the implementation changes we still get the same behavior.
 
         [Fact]
-        public void OpenVault_returns_accounts()
+        public async Task OpenVault_returns_accounts()
+        {
+            // Arrange
+            var flow = new RestFlow()
+                .Get(RegularLoginResponse) // 1. Check account type
+                .Post(IterationResponse) // 2. Normal login attempt
+                .ExpectUrl("/login.php")
+                .Post(OkResponseValidPrivateKey) // 3. Login with updated iteration count
+                .ExpectUrl("/login.php")
+                .Get(BlobBase64) // 4. Get vault
+                .ExpectUrl("/getaccts.php?")
+                .Post("") // 5. Logout
+                .ExpectUrl("/logout.php");
+
+            // Act
+            // TODO: Decryption fails here because of the incorrect password
+            var accounts = await Client.OpenVault(Username, Password, ClientInfo, null, flow, ParserOptions.Default, null, CancellationToken.None);
+
+            // Assert
+            accounts.Should().NotBeEmpty();
+        }
+
+        [Fact]
+        public async Task OpenVault_returns_accounts_with_iteration_retry()
+        {
+            // Arrange
+            var flow = new RestFlow()
+                .Get(RegularLoginResponse) // 1. Check account type
+                .Post(IterationResponse) // 2. Normal login attempt
+                .ExpectUrl("/login.php")
+                .Post(OkResponseValidPrivateKey) // 3. Login with updated iteration count
+                .ExpectUrl("/login.php")
+                .Get(BlobBase64) // 4. Get vault
+                .ExpectUrl("/getaccts.php?")
+                .Post("") // 5. Logout
+                .ExpectUrl("/logout.php");
+
+            // Act
+            // TODO: Decryption fails here because of the incorrect password
+            var accounts = await Client.OpenVault(Username, Password, ClientInfo, null, flow, ParserOptions.Default, null, CancellationToken.None);
+
+            // Assert
+            accounts.Should().NotBeEmpty();
+        }
+
+        [Fact]
+        public async Task OpenVault_returns_accounts_with_otp()
+        {
+            // Arrange
+            var flow = new RestFlow()
+                .Get(RegularLoginResponse) // 1. Check account type
+                .Post(IterationResponse) // 2. Normal login attempt
+                .ExpectUrl("/login.php")
+                .Post(OtpRequiredResponse) // 3. Login with updated iteration count
+                .ExpectUrl("/login.php")
+                .Post(OkResponseValidPrivateKey) // 4. Login with OTP
+                .ExpectUrl("/login.php")
+                .ExpectContent($"otp={Otp}")
+                .Get(BlobBase64) // 5. Get vault
+                .ExpectUrl("/getaccts.php?")
+                .Post("") // 6. Logout
+                .ExpectUrl("/logout.php");
+
+            // Act
+            // TODO: Decryption fails here because of the incorrect password
+            var accounts = await Client.OpenVault(
+                Username,
+                Password,
+                ClientInfo,
+                GetOtpProvidingUi(),
+                flow,
+                ParserOptions.Default,
+                null,
+                CancellationToken.None
+            );
+
+            // Assert
+            accounts.Should().NotBeEmpty();
+        }
+
+        [Fact]
+        public async Task OpenVault_returns_accounts_with_otp_and_remember_me()
+        {
+            // Arrange
+            var flow = new RestFlow()
+                .Get(RegularLoginResponse) // 1. Check account type
+                .Post(IterationResponse) // 2. Normal login attempt
+                .ExpectUrl("/login.php")
+                .Post(OtpRequiredResponse) // 3. Login with updated iteration count
+                .ExpectUrl("/login.php")
+                .Post(OkResponseValidPrivateKey) // 4. Login with OTP
+                .ExpectUrl("/login.php")
+                .ExpectContent($"otp={Otp}")
+                .Post("") // 5. Save trusted device
+                .ExpectUrl("/trust.php")
+                .Get(BlobBase64) // 6. Get vault
+                .ExpectUrl("/getaccts.php?")
+                .Post("") // 7. Logout
+                .ExpectUrl("/logout.php");
+
+            // Act
+            // TODO: Decryption fails here because of the incorrect password
+            var accounts = await Client.OpenVault(
+                Username,
+                Password,
+                ClientInfo,
+                GetOtpProvidingWithRememberMeUi(),
+                flow,
+                ParserOptions.Default,
+                null,
+                CancellationToken.None
+            );
+
+            // Assert
+            accounts.Should().NotBeEmpty();
+        }
+
+        [Fact]
+        public async Task OpenVault_returns_accounts_with_oob()
+        {
+            // Arrange
+            var flow = new RestFlow()
+                .Get(RegularLoginResponse) // 1. Check account type
+                .Post(IterationResponse) // 2. Normal login attempt
+                .ExpectUrl("/login.php")
+                .Post(OobRequiredResponse) // 3. Login with updated iteration count
+                .ExpectUrl("/login.php")
+                .Post(OobRetryResponse) // 4. Login with OOB
+                .ExpectUrl("/login.php")
+                .ExpectContent("outofbandrequest=1")
+                .Post(OkResponseValidPrivateKey) // 5. Retry to login with OOB
+                .ExpectUrl("/login.php")
+                .ExpectContent("outofbandrequest=1")
+                .ExpectContent("outofbandretry=1")
+                .ExpectContent("outofbandretryid=retry-id")
+                .Get(BlobBase64) // 6. Get vault
+                .ExpectUrl("/getaccts.php?")
+                .Post("") // 7. Logout
+                .ExpectUrl("/logout.php");
+
+            // Act
+            // TODO: Decryption fails here because of the incorrect password
+            var accounts = await Client.OpenVault(
+                Username,
+                Password,
+                ClientInfo,
+                GetWaitingForOobUi(),
+                flow,
+                ParserOptions.Default,
+                null,
+                CancellationToken.None
+            );
+
+            // Assert
+            accounts.Should().NotBeEmpty();
+        }
+
+        [Fact]
+        public async Task OpenVault_returns_accounts_with_oob_and_remember_me()
+        {
+            // Arrange
+            var flow = new RestFlow()
+                .Get(RegularLoginResponse) // 1. Check account type
+                .Post(IterationResponse) // 2. Normal login attempt
+                .ExpectUrl("/login.php")
+                .Post(OobRequiredResponse) // 3. Login with updated iteration count
+                .ExpectUrl("/login.php")
+                .Post(OobRetryResponse) // 4. Login with OOB
+                .ExpectUrl("/login.php")
+                .ExpectContent("outofbandrequest=1")
+                .Post(OkResponseValidPrivateKey) // 5. Retry to login with OOB
+                .ExpectUrl("/login.php")
+                .ExpectContent("outofbandrequest=1")
+                .ExpectContent("outofbandretry=1")
+                .ExpectContent("outofbandretryid=retry-id")
+                .Post("") // 6. Save trusted device
+                .ExpectUrl("/trust.php")
+                .Get(BlobBase64) // 7. Get vault
+                .ExpectUrl("/getaccts.php?")
+                .Post("") // 8. Logout
+                .ExpectUrl("/logout.php");
+
+            // Act
+            // TODO: Decryption fails here because of the incorrect password
+            var accounts = await Client.OpenVault(
+                Username,
+                Password,
+                ClientInfo,
+                GetWaitingForOobWithRememberMeUi(),
+                flow,
+                ParserOptions.Default,
+                null,
+                CancellationToken.None
+            );
+
+            // Assert
+            accounts.Should().NotBeEmpty();
+        }
+
+        [Fact]
+        public async Task OpenVault_returns_accounts_with_duo_v4()
         {
             var flow = new RestFlow()
-                .Post(IterationResponse)
-                    .ExpectUrl("/login.php")
-                .Post(OkResponseValidPrivateKey)
-                    .ExpectUrl("/login.php")
-                .Get(BlobBase64)
-                    .ExpectUrl("/getaccts.php?")
-                .Post("")
-                    .ExpectUrl("/logout.php");
+                .Get(RegularLoginResponse) // 1. Check account type
+                .Post(IterationResponse) // 2. Normal login attempt
+                .ExpectUrl("/login.php")
+                .Post(DuoV4RequiredResponse) // 3. Login with updated iteration count
+                .ExpectUrl("/login.php")
+                .LastPassDuo() // 4. Login with Duo
+                .Post(OkResponseValidPrivateKey) // 5. Submit Duo passcode
+                .Get(BlobBase64) // 6. Get vault
+                .ExpectUrl("/getaccts.php?")
+                .Post("") // 7. Logout
+                .ExpectUrl("/logout.php");
 
-            // TODO: Decryption fails here because of the incorrect password
-            var accounts = Client.OpenVault(Username, Password, ClientInfo, null, flow, ParserOptions.Default);
+            var accounts = await Client.OpenVault(
+                Username,
+                Password,
+                ClientInfo,
+                GetWaitingForOobUi(),
+                flow,
+                ParserOptions.Default,
+                null,
+                CancellationToken.None
+            );
 
             Assert.NotEmpty(accounts);
         }
 
         [Fact]
-        public void OpenVault_returns_accounts_with_iteration_retry()
+        public async Task OpenVault_lower_cases_email()
         {
+            // Arrange
             var flow = new RestFlow()
-                .Post(IterationResponse)
-                    .ExpectUrl("/login.php")
-                .Post(OkResponseValidPrivateKey)
-                    .ExpectUrl("/login.php")
-                .Get(BlobBase64)
-                    .ExpectUrl("/getaccts.php?")
-                .Post("")
-                    .ExpectUrl("/logout.php");
+                .Get(RegularLoginResponse) // 1. Check account type
+                .Post(IterationResponse) // 2. Normal login attempt
+                .ExpectUrl("/login.php")
+                .ExpectContent($"username={Username.EncodeUriData()}")
+                .Post(OkResponseValidPrivateKey) // 3. Login with updated iteration count
+                .ExpectUrl("/login.php")
+                .ExpectContent($"username={Username.EncodeUriData()}")
+                .Get(BlobBase64) // 4. Get vault
+                .Post("") // 5. Logout
+                .ExpectUrl("/logout.php");
 
+            // Act
             // TODO: Decryption fails here because of the incorrect password
-            var accounts = Client.OpenVault(Username, Password, ClientInfo, null, flow, ParserOptions.Default);
+            var accounts = await Client.OpenVault(
+                Username.ToUpperInvariant(),
+                Password,
+                ClientInfo,
+                null,
+                flow,
+                ParserOptions.Default,
+                null,
+                CancellationToken.None
+            );
 
-            Assert.NotEmpty(accounts);
+            // Assert
+            accounts.Should().NotBeEmpty();
         }
 
         [Fact]
-        public void OpenVault_returns_accounts_with_otp()
+        public async Task OpenVault_throws_on_invalid_username()
         {
+            // Arrange
             var flow = new RestFlow()
-                .Post(IterationResponse)
-                    .ExpectUrl("/login.php")
-                .Post(OtpRequiredResponse)
-                    .ExpectUrl("/login.php")
-                .Post(OkResponseValidPrivateKey)
-                    .ExpectUrl("/login.php")
-                    .ExpectContent($"otp={Otp}")
-                .Get(BlobBase64)
-                    .ExpectUrl("/getaccts.php?")
-                .Post("")
-                    .ExpectUrl("/logout.php");
+                .Get(RegularLoginResponse) // 1. Check account type
+                .Post("""<response><error cause="user_not_exists" /></response>"""); // 2. Normal login attempt
 
-            // TODO: Decryption fails here because of the incorrect password
-            var accounts = Client.OpenVault(Username, Password, ClientInfo, OtpProvidingUi, flow, ParserOptions.Default);
+            // Act
+            var act = () => Client.OpenVault(Username, Password, ClientInfo, null, flow, ParserOptions.Default, null, CancellationToken.None);
 
-            Assert.NotEmpty(accounts);
+            // Assert
+            await act.Should().ThrowAsync<BadCredentialsException>().WithMessage("Invalid username");
         }
 
         [Fact]
-        public void OpenVault_returns_accounts_with_otp_and_rememeber_me()
+        public async Task OpenVault_throws_on_invalid_password()
         {
+            // Arrange
             var flow = new RestFlow()
-                .Post(IterationResponse)
-                    .ExpectUrl("/login.php")
-                .Post(OtpRequiredResponse)
-                    .ExpectUrl("/login.php")
-                .Post(OkResponseValidPrivateKey)
-                    .ExpectUrl("/login.php")
-                    .ExpectContent($"otp={Otp}")
-                .Post("")
-                    .ExpectUrl("/trust.php")
-                .Get(BlobBase64)
-                    .ExpectUrl("/getaccts.php?")
-                .Post("")
-                    .ExpectUrl("/logout.php");
+                .Get(RegularLoginResponse) // 1. Check account type
+                .Post("""<response><error cause="password_invalid" /></response>"""); // 2. Normal login attempt
 
-            // TODO: Decryption fails here because of the incorrect password
-            var accounts = Client.OpenVault(Username,
-                                            Password,
-                                            ClientInfo,
-                                            OtpProvidingWithRememberMeUi,
-                                            flow,
-                                            ParserOptions.Default);
+            // Act
+            var act = () => Client.OpenVault(Username, Password, ClientInfo, null, flow, ParserOptions.Default, null, CancellationToken.None);
 
-            Assert.NotEmpty(accounts);
+            // Assert
+            await act.Should().ThrowAsync<BadCredentialsException>().WithMessage("Invalid password");
         }
 
         [Fact]
-        public void OpenVault_returns_accounts_with_oob()
+        public async Task OpenVault_throws_on_canceled_otp()
         {
+            // Arrange
             var flow = new RestFlow()
-                .Post(IterationResponse)
-                    .ExpectUrl("/login.php")
-                .Post(OobRequiredResponse)
-                    .ExpectUrl("/login.php")
-                .Post(OobRetryResponse)
-                    .ExpectUrl("/login.php")
-                    .ExpectContent("outofbandrequest=1")
-                .Post(OkResponseValidPrivateKey)
-                    .ExpectUrl("/login.php")
-                    .ExpectContent("outofbandrequest=1")
-                    .ExpectContent("outofbandretry=1")
-                    .ExpectContent("outofbandretryid=retry-id")
-                .Get(BlobBase64)
-                    .ExpectUrl("/getaccts.php?")
-                .Post("")
-                    .ExpectUrl("/logout.php");
+                .Get(RegularLoginResponse) // 1. Check account type
+                .Post(OtpRequiredResponse); // 2. Normal login attempt
 
-            // TODO: Decryption fails here because of the incorrect password
-            var accounts = Client.OpenVault(Username,
-                                            Password,
-                                            ClientInfo,
-                                            WaitingForOobUi,
-                                            flow,
-                                            ParserOptions.Default);
+            // Act
+            var act = () =>
+                Client.OpenVault(Username, Password, ClientInfo, GetCancelingUi(), flow, ParserOptions.Default, null, CancellationToken.None);
 
-            Assert.NotEmpty(accounts);
+            // Assert
+            await act.Should().ThrowAsync<CanceledMultiFactorException>().WithMessage("Second factor step is canceled by the user");
         }
 
         [Fact]
-        public void OpenVault_returns_accounts_with_oob_and_rememeber_me()
+        public async Task OpenVault_throws_on_failed_otp()
         {
+            // Arrange
+            // Need to retry OTP 3 times because of the 3 attempts limit
             var flow = new RestFlow()
-                .Post(IterationResponse)
-                    .ExpectUrl("/login.php")
-                .Post(OobRequiredResponse)
-                    .ExpectUrl("/login.php")
-                .Post(OobRetryResponse)
-                    .ExpectUrl("/login.php")
-                    .ExpectContent("outofbandrequest=1")
-                .Post(OkResponseValidPrivateKey)
-                    .ExpectUrl("/login.php")
-                    .ExpectContent("outofbandrequest=1")
-                    .ExpectContent("outofbandretry=1")
-                    .ExpectContent("outofbandretryid=retry-id")
-                .Post("")
-                    .ExpectUrl("/trust.php")
-                .Get(BlobBase64)
-                    .ExpectUrl("/getaccts.php?")
-                .Post("")
-                    .ExpectUrl("/logout.php");
+                .Get(RegularLoginResponse) // 1. Check account type
+                .Post(OtpRequiredResponse) // 2. Normal login attempt
+                .Post(OtpFailedResponse) // 3. Login with OTP (attempt 1)
+                .Post(OtpFailedResponse) // 4. Login with OTP (attempt 2)
+                .Post(OtpFailedResponse); // 5. Login with OTP (attempt 3)
 
-            // TODO: Decryption fails here because of the incorrect password
-            var accounts = Client.OpenVault(Username,
-                                            Password,
-                                            ClientInfo,
-                                            WaitingForOobWithRememberMeUi,
-                                            flow,
-                                            ParserOptions.Default);
+            // Act
+            var act = () =>
+                Client.OpenVault(Username, Password, ClientInfo, GetOtpProvidingUi(), flow, ParserOptions.Default, null, CancellationToken.None);
 
-            Assert.NotEmpty(accounts);
+            // Assert
+            await act.Should().ThrowAsync<BadMultiFactorException>().WithMessage("Second factor code is incorrect");
         }
 
         [Fact]
-        public void OpenVault_lower_cases_email()
+        public async Task OpenVault_throws_on_canceled_oob()
         {
+            // Arrange
             var flow = new RestFlow()
-                .Post(IterationResponse)
-                    .ExpectUrl("/login.php")
-                    .ExpectContent($"username={Username.EncodeUriData()}")
-                .Post(OkResponseValidPrivateKey)
-                    .ExpectUrl("/login.php")
-                    .ExpectContent($"username={Username.EncodeUriData()}")
-                .Get(BlobBase64)
-                .Post("");
+                .Get(RegularLoginResponse) // 1. Check account type
+                .Post(OobRequiredResponse); // 2. Normal login attempt
 
-            // TODO: Decryption fails here because of the incorrect password
-            var accounts = Client.OpenVault(Username.ToUpperInvariant(),
-                                            Password,
-                                            ClientInfo,
-                                            null,
-                                            flow,
-                                            ParserOptions.Default);
+            // Act
+            var act = () =>
+                Client.OpenVault(Username, Password, ClientInfo, GetCancelingUi(), flow, ParserOptions.Default, null, CancellationToken.None);
 
-            Assert.NotEmpty(accounts);
+            // Assert
+            await act.Should().ThrowAsync<CanceledMultiFactorException>().WithMessage("Out of band step is canceled by the user");
         }
 
         [Fact]
-        public void OpenVault_throws_on_invalid_username()
+        public async Task OpenVault_throws_on_failed_oob()
         {
+            // Arrange
             var flow = new RestFlow()
-                .Post("<response><error cause='unknownemail' /></response>");
+                .Get(RegularLoginResponse) // 1. Check account type
+                .Post(OobRequiredResponse) // 2. Normal login attempt
+                .Post("<response><error cause='multifactorresponsefailed' /></response>"); // 3. Login with OOB
 
-            Exceptions.AssertThrowsBadCredentials(
-                () => Client.OpenVault(Username, Password, ClientInfo, null, flow, ParserOptions.Default),
-                "Invalid username");
-        }
+            // Act
+            var act = () =>
+                Client.OpenVault(Username, Password, ClientInfo, GetWaitingForOobUi(), flow, ParserOptions.Default, null, CancellationToken.None);
 
-        [Fact]
-        public void OpenVault_throws_on_invalid_password()
-        {
-            var flow = new RestFlow()
-                .Post("<response><error cause='unknownpassword' /></response>");
-
-            Exceptions.AssertThrowsBadCredentials(
-                () => Client.OpenVault(Username, Password, ClientInfo, null, flow, ParserOptions.Default),
-                "Invalid password");
-        }
-
-        [Fact]
-        public void OpenVault_throws_on_canceled_otp()
-        {
-            var flow = new RestFlow()
-                .Post(OtpRequiredResponse);
-
-            Exceptions.AssertThrowsCanceledMultiFactor(
-                () => Client.OpenVault(Username, Password, ClientInfo, CancelingUi, flow, ParserOptions.Default),
-                "Second factor step is canceled by the user");
-        }
-
-        [Fact]
-        public void OpenVault_throws_on_failed_otp()
-        {
-            var flow = new RestFlow()
-                .Post(OtpRequiredResponse)
-                .Post("<response><error cause='googleauthfailed' /></response>");
-
-            Exceptions.AssertThrowsBadMultiFactor(
-                () => Client.OpenVault(Username, Password, ClientInfo, OtpProvidingUi, flow, ParserOptions.Default),
-                "Second factor code is incorrect");
-        }
-
-        [Fact]
-        public void OpenVault_throws_on_canceled_oob()
-        {
-            var flow = new RestFlow()
-                .Post(OobRequiredResponse);
-
-            Exceptions.AssertThrowsCanceledMultiFactor(
-                () => Client.OpenVault(Username, Password, ClientInfo, CancelingUi, flow, ParserOptions.Default),
-                "Out of band step is canceled by the user");
-        }
-
-        [Fact]
-        public void OpenVault_throws_on_failed_oob()
-        {
-            var flow = new RestFlow()
-                .Post(OobRequiredResponse)
-                .Post("<response><error cause='multifactorresponsefailed' /></response>");
-
-            Exceptions.AssertThrowsBadMultiFactor(
-                () => Client.OpenVault(Username, Password, ClientInfo, WaitingForOobUi, flow, ParserOptions.Default),
-                "Out of band authentication failed");
+            // Assert
+            await act.Should().ThrowAsync<BadMultiFactorException>().WithMessage("Out of band authentication failed");
         }
 
         [Theory]
@@ -270,332 +388,589 @@ namespace PasswordManagerAccess.Test.LastPass
         [InlineData("<response><error cause='Pfff' message='Blah' /></response>", "Blah")]
         [InlineData("<response><error message='Blah' /></response>", "Blah")]
         [InlineData("<response><error /></response>", "Unknown error")]
-        public void OpenVault_throws_on_other_errors(string response, string expected)
+        public async Task OpenVault_throws_on_other_errors(string response, string expected)
         {
+            // Arrange
             var flow = new RestFlow()
-                .Post(response);
+                .Get(RegularLoginResponse) // 1. Check account type
+                .Post(response); // 2. Normal login attempt
 
-            Exceptions.AssertThrowsInternalError(
-                () => Client.OpenVault(Username, Password, ClientInfo, null, flow, ParserOptions.Default),
-                expected);
+            // Act
+            var act = () => Client.OpenVault(Username, Password, ClientInfo, null, flow, ParserOptions.Default, null, CancellationToken.None);
+
+            // Assert
+            await act.Should().ThrowAsync<InternalErrorException>().WithMessage(expected);
         }
 
         [Fact]
-        public void Login_returns_session_and_rest_client()
+        public async Task OpenVault_logs_to_secure_logger()
         {
+            // Arrange
             var flow = new RestFlow()
-                .Post(OkResponse);
+                .Get(RegularLoginResponse) // 1. Check account type
+                .Post("<response><error cause='Blah' /></response>"); // 2. Normal login attempt
+            var logger = new FakeSecureLogger();
 
-            var (session, rest) = Client.Login(Username, Password, ClientInfo, null, flow);
+            // Act
+            var act = () =>
+                Client.OpenVault(
+                    Username,
+                    Password,
+                    ClientInfo,
+                    null,
+                    flow,
+                    new ParserOptions { LoggingEnabled = true },
+                    logger,
+                    CancellationToken.None
+                );
 
-            Assert.Equal(DefaultKeyIterationCount, session.KeyIterationCount);
-            AssertSessionWithPrivateKey(session);
-
-            Assert.Equal(BaseUrl, rest.BaseUrl);
+            // Assert
+            await act.Should().ThrowAsync<InternalErrorException>().WithMessage("*Blah*");
+            logger.Entries.Should().NotBeEmpty();
+            logger.Entries.Should().ContainSingle(x => x.Message.Contains("POST https://lastpass.com/login.php"));
         }
 
         [Fact]
-        public void Login_returns_session_and_rest_client_with_iteration_retry()
+        public async Task OpenVault_does_not_log_to_secure_logger_when_logging_is_disabled()
         {
+            // Arrange
             var flow = new RestFlow()
-                .Post(IterationResponse)
-                .Post(OkResponse);
+                .Get(RegularLoginResponse) // 1. Check account type
+                .Post("<response><error cause='Blah' /></response>"); // 2. Normal login attempt
+            var logger = new FakeSecureLogger();
 
-            var (session, rest) = Client.Login(Username, Password, ClientInfo, null, flow);
+            // Act
+            var act = () =>
+                Client.OpenVault(
+                    Username,
+                    Password,
+                    ClientInfo,
+                    null,
+                    flow,
+                    new ParserOptions { LoggingEnabled = false },
+                    logger,
+                    CancellationToken.None
+                );
 
-            Assert.Equal(IterationCount, session.KeyIterationCount);
-            AssertSessionWithPrivateKey(session);
-
-            Assert.Equal(BaseUrl, rest.BaseUrl);
+            // Assert
+            await act.Should().ThrowAsync<InternalErrorException>().WithMessage("*Blah*");
+            logger.Entries.Should().BeEmpty();
         }
 
         [Fact]
-        public void Login_returns_session_and_rest_client_with_server_retry()
+        public async Task OpenVault_with_duo_v4_does_not_log_to_secure_logger_when_logging_is_disabled()
         {
+            // Arrange
             var flow = new RestFlow()
-                .Post(ServerResponse)
-                    .ExpectUrl(BaseUrl)
-                .Post(OkResponse)
-                    .ExpectUrl(AlternativeBaseUrl);
+                .Get(RegularLoginResponse) // 1. Check account type
+                .Post(IterationResponse) // 2. Normal login attempt
+                .ExpectUrl("/login.php")
+                .Post(DuoV4RequiredResponse) // 3. Login with updated iteration count
+                .ExpectUrl("/login.php")
+                .LastPassDuo() // 4. Login with Duo
+                .Post(OkResponseValidPrivateKey) // 5. Submit Duo passcode
+                .Get(BlobBase64) // 6. Get vault
+                .ExpectUrl("/getaccts.php?")
+                .Post("") // 7. Logout
+                .ExpectUrl("/logout.php");
+            var logger = new FakeSecureLogger();
 
-            var (session, rest) = Client.Login(Username, Password, ClientInfo, null, flow);
+            // Act
+            await Client.OpenVault(Username, Password, ClientInfo, GetWaitingForOobUi(), flow, ParserOptions.Default, logger, CancellationToken.None);
 
-            Assert.Equal(DefaultKeyIterationCount, session.KeyIterationCount);
-            AssertSessionWithPrivateKey(session);
-
-            Assert.Equal(AlternativeBaseUrl, rest.BaseUrl);
+            // Assert
+            logger.Entries.Should().BeEmpty();
         }
 
         [Fact]
-        public void Login_returns_session_and_rest_client_with_server_and_iteration_retries()
+        public async Task OpenVault_with_duo_v4_does_not_log_to_secure_logger_when_logger_is_null()
         {
+            // Arrange
             var flow = new RestFlow()
-                .Post(ServerResponse)
-                    .ExpectUrl(BaseUrl)
-                .Post(IterationResponse)
-                    .ExpectUrl(AlternativeBaseUrl)
-                .Post(OkResponse)
-                    .ExpectUrl(AlternativeBaseUrl);
+                .Get(RegularLoginResponse) // 1. Check account type
+                .Post(IterationResponse) // 2. Normal login attempt
+                .ExpectUrl("/login.php")
+                .Post(DuoV4RequiredResponse) // 3. Login with updated iteration count
+                .ExpectUrl("/login.php")
+                .LastPassDuo() // 4. Login with Duo
+                .Post(OkResponseValidPrivateKey) // 5. Submit Duo passcode
+                .Get(BlobBase64) // 6. Get vault
+                .ExpectUrl("/getaccts.php?")
+                .Post("")
+                .ExpectUrl("/logout.php");
 
-            var (session, rest) = Client.Login(Username, Password, ClientInfo, null, flow);
+            // Act
+            await Client.OpenVault(Username, Password, ClientInfo, GetWaitingForOobUi(), flow, ParserOptions.Default, null, CancellationToken.None);
 
-            Assert.Equal(IterationCount, session.KeyIterationCount);
-            AssertSessionWithPrivateKey(session);
-
-            Assert.Equal(AlternativeBaseUrl, rest.BaseUrl);
+            // Nothing to assert. We expect no exceptions.
         }
 
         [Fact]
-        public void Login_returns_session_and_rest_client_with_otp()
+        public async Task OpenVault_attaches_log_to_exception()
         {
+            // Arrange
             var flow = new RestFlow()
-                .Post(OtpRequiredResponse) // 1. normal login attempt
-                .Post(OkResponse)          // 2. login with otp
-                .Post("");                 // 3. save trusted device
+                .Get(RegularLoginResponse) // 1. Check account type
+                .Post("<response><error cause='Blah' /></response>"); // 2. Normal login attempt
 
-            var (session, rest) = Client.Login(Username, Password, ClientInfo, OtpProvidingUi, flow);
+            // Act
+            var act = () =>
+                Client.OpenVault(
+                    Username,
+                    Password,
+                    ClientInfo,
+                    null,
+                    flow,
+                    new ParserOptions { LoggingEnabled = true },
+                    new NullLogger(),
+                    CancellationToken.None
+                );
 
-            Assert.Equal(DefaultKeyIterationCount, session.KeyIterationCount);
-            AssertSessionWithPrivateKey(session);
-
-            Assert.Equal(BaseUrl, rest.BaseUrl);
+            // Assert
+            var e = await act.Should().ThrowAsync<InternalErrorException>().WithMessage("*Blah*");
+            e.And.Log.Should().NotBeEmpty();
+            e.And.Log.Should().ContainSingle(x => x.Message.Contains("POST https://lastpass.com/login.php"));
         }
 
         [Fact]
-        public void Login_returns_session_and_rest_client_with_iteration_retry_and_otp()
+        public async Task OpenVault_does_not_attach_log_when_logging_is_disabled()
         {
+            // Arrange
             var flow = new RestFlow()
-                .Post(IterationResponse)   // 1. normal login attempt
-                .Post(OtpRequiredResponse) // 2. normal login attempt with updated iteration count
-                .Post(OkResponse)          // 3. login with otp
-                .Post("");                 // 4. save trusted device
+                .Get(RegularLoginResponse) // 1. Check account type
+                .Post("<response><error cause='Blah' /></response>"); // 2. Normal login attempt
 
-            var (session, rest) = Client.Login(Username, Password, ClientInfo, OtpProvidingUi, flow);
+            // Act
+            var act = () =>
+                Client.OpenVault(
+                    Username,
+                    Password,
+                    ClientInfo,
+                    null,
+                    flow,
+                    new ParserOptions { LoggingEnabled = false },
+                    null,
+                    CancellationToken.None
+                );
 
-            Assert.Equal(IterationCount, session.KeyIterationCount);
-            AssertSessionWithPrivateKey(session);
+            // Assert
+            var e = await act.Should().ThrowAsync<InternalErrorException>().WithMessage("*Blah*");
+            e.And.Log.Should().BeEmpty();
+        }
 
-            Assert.Equal(BaseUrl, rest.BaseUrl);
+        [Theory]
+        [InlineData("blahblah")]
+        [InlineData("BlahBlah")]
+        [InlineData("BLAHBLAH")]
+        public async Task OpenVault_censors_username_in_logs(string username)
+        {
+            // Arrange
+            var flow = new RestFlow()
+                .Get(RegularLoginResponse) // 1. Check account type
+                .Post("<response><error cause='Blah' /></response>"); // 2. Normal login attempt
+
+            // Act
+            var act = () =>
+                Client.OpenVault(
+                    username,
+                    Password,
+                    ClientInfo,
+                    null,
+                    flow,
+                    new ParserOptions { LoggingEnabled = true },
+                    null,
+                    CancellationToken.None
+                );
+
+            // Assert
+            var e = await act.Should().ThrowAsync<InternalErrorException>().WithMessage("*Blah*");
+            e.And.Log.Should().ContainSingle(x => x.Message.Contains("&username=********&"));
         }
 
         [Fact]
-        public void Login_returns_session_and_rest_client_with_oob()
+        public async Task Login_returns_session_and_rest_client()
         {
+            // Arrange
             var flow = new RestFlow()
-                .Post(OobRequiredResponse) // 1. normal login attempt
-                .Post(OkResponse)          // 2. check oob
-                .Post("");                 // 3. save trusted device
+                .Get(RegularLoginResponse) // 1. Check account type
+                .Post(OkResponse); // 2. Normal login attempt
 
-            var (session, rest) = Client.Login(Username, Password, ClientInfo, WaitingForOobUi, flow);
+            // Act
+            var (state, rest) = await Client.Login(Username, Password, ClientInfo, null, flow, null, CancellationToken.None);
 
-            Assert.Equal(DefaultKeyIterationCount, session.KeyIterationCount);
-            AssertSessionWithPrivateKey(session);
-
-            Assert.Equal(BaseUrl, rest.BaseUrl);
+            // Assert
+            AssertLoginStateWithPrivateKey(state);
+            rest.BaseUrl.Should().Be(BaseUrl);
         }
 
         [Fact]
-        public void Login_returns_session_and_rest_client_with_iteration_retry_and_oob()
+        public async Task Login_returns_session_and_rest_client_with_iteration_retry()
         {
+            // Arrange
             var flow = new RestFlow()
-                .Post(IterationResponse)   // 1. normal login attempt
-                .Post(OobRequiredResponse) // 2. normal login attempt with updated iteration count
-                .Post(OkResponse)          // 3. check oob
-                .Post("");                 // 4. save trusted device
+                .Get(RegularLoginResponse) // 1. Check account type
+                .Post(IterationResponse) // 2. Normal login attempt
+                .Post(OkResponse); // 3. Login with updated iteration count
 
-            var (session, rest) = Client.Login(Username, Password, ClientInfo, WaitingForOobUi, flow);
+            // Act
+            var (state, rest) = await Client.Login(Username, Password, ClientInfo, null, flow, null, CancellationToken.None);
 
-            Assert.Equal(IterationCount, session.KeyIterationCount);
-            AssertSessionWithPrivateKey(session);
-
-            Assert.Equal(BaseUrl, rest.BaseUrl);
+            // Assert
+            AssertLoginStateWithPrivateKey(state);
+            rest.BaseUrl.Should().Be(BaseUrl);
         }
 
         [Fact]
-        public void PerformSingleLoginRequest_returns_parsed_xml()
+        public async Task Login_returns_session_and_rest_client_with_server_retry()
         {
+            // Arrange
+            var flow = new RestFlow()
+                .Get(RegularLoginResponse) // 1. Check account type
+                .Post(ServerResponse) // 2. Normal login attempt
+                .ExpectUrl(BaseUrl)
+                .Post(OkResponse) // 3. Login with updated server
+                .ExpectUrl(AlternativeBaseUrl);
+
+            // Act
+            var (state, rest) = await Client.Login(Username, Password, ClientInfo, null, flow, null, CancellationToken.None);
+
+            // Assert
+            AssertLoginStateWithPrivateKey(state);
+            rest.BaseUrl.Should().Be(AlternativeBaseUrl);
+        }
+
+        [Fact]
+        public async Task Login_returns_session_and_rest_client_with_server_and_iteration_retries()
+        {
+            // Arrange
+            var flow = new RestFlow()
+                .Get(RegularLoginResponse) // 1. Check account type
+                .Post(ServerResponse) // 2. Normal login attempt
+                .ExpectUrl(BaseUrl)
+                .Post(IterationResponse) // 3. Login with updated server
+                .ExpectUrl(AlternativeBaseUrl)
+                .Post(OkResponse) // 4. Login with updated iteration count and server
+                .ExpectUrl(AlternativeBaseUrl);
+
+            // Act
+            var (state, rest) = await Client.Login(Username, Password, ClientInfo, null, flow, null, CancellationToken.None);
+
+            // Assert
+            AssertLoginStateWithPrivateKey(state);
+            rest.BaseUrl.Should().Be(AlternativeBaseUrl);
+        }
+
+        [Fact]
+        public async Task Login_returns_session_and_rest_client_with_otp()
+        {
+            // Arrange
+            var flow = new RestFlow()
+                .Get(RegularLoginResponse) // 1. Check account type
+                .Post(OtpRequiredResponse) // 2. Normal login attempt
+                .Post(OkResponse) // 3. Login with OTP
+                .Post(""); // 4. Save trusted device
+
+            // Act
+            var (state, rest) = await Client.Login(Username, Password, ClientInfo, GetOtpProvidingUi(), flow, null, CancellationToken.None);
+
+            // Assert
+            AssertLoginStateWithPrivateKey(state);
+            rest.BaseUrl.Should().Be(BaseUrl);
+        }
+
+        [Fact]
+        public async Task Login_returns_session_and_rest_client_with_iteration_retry_and_otp()
+        {
+            // Arrange
+            var flow = new RestFlow()
+                .Get(RegularLoginResponse) // 1. Check account type
+                .Post(IterationResponse) // 2. Normal login attempt
+                .Post(OtpRequiredResponse) // 3. Normal login attempt with updated iteration count
+                .Post(OkResponse) // 4. Login with OTP
+                .Post(""); // 5. Save trusted device
+
+            // Act
+            var (state, rest) = await Client.Login(Username, Password, ClientInfo, GetOtpProvidingUi(), flow, null, CancellationToken.None);
+
+            // Assert
+            AssertLoginStateWithPrivateKey(state);
+            rest.BaseUrl.Should().Be(BaseUrl);
+        }
+
+        [Fact]
+        public async Task Login_returns_session_and_rest_client_with_oob()
+        {
+            // Arrange
+            var flow = new RestFlow()
+                .Get(RegularLoginResponse) // 1. Check account type
+                .Post(OobRequiredResponse) // 2. Normal login attempt
+                .Post(OkResponse) // 3. Check OOB
+                .Post(""); // 4. Save trusted device
+
+            // Act
+            var (state, rest) = await Client.Login(Username, Password, ClientInfo, GetWaitingForOobUi(), flow, null, CancellationToken.None);
+
+            // Assert
+            AssertLoginStateWithPrivateKey(state);
+            rest.BaseUrl.Should().Be(BaseUrl);
+        }
+
+        [Fact]
+        public async Task Login_returns_session_and_rest_client_with_iteration_retry_and_oob()
+        {
+            // Arrange
+            var flow = new RestFlow()
+                .Get(RegularLoginResponse) // 1. Check account type
+                .Post(IterationResponse) // 2. Normal login attempt
+                .Post(OobRequiredResponse) // 3. Normal login attempt with updated iteration count
+                .Post(OkResponse) // 4. Check OOB
+                .Post(""); // 5. Save trusted device
+
+            // Act
+            var (state, rest) = await Client.Login(Username, Password, ClientInfo, GetWaitingForOobUi(), flow, null, CancellationToken.None);
+
+            // Assert
+            AssertLoginStateWithPrivateKey(state);
+            rest.BaseUrl.Should().Be(BaseUrl);
+        }
+
+        [Fact]
+        public async Task PerformSingleLoginRequest_returns_parsed_xml()
+        {
+            // Arrange
             var flow = new RestFlow().Post("<ok />");
-            var xml = Client.PerformSingleLoginRequest(Username,
-                                                       Password,
-                                                       1,
-                                                       new Dictionary<string, object>(),
-                                                       ClientInfo,
-                                                       flow);
 
-            Assert.NotNull(xml);
+            // Act
+            var xml = await Client.PerformSingleLoginRequest(
+                Username,
+                Password,
+                1,
+                MfaMethod.None,
+                false,
+                [],
+                ClientInfo,
+                flow,
+                CancellationToken.None
+            );
+
+            // Assert
+            xml.Should().NotBeNull();
         }
 
         [Fact]
-        public void PerformSingleLoginRequest_makes_POST_request_to_specific_url_with_parameters()
+        public async Task PerformSingleLoginRequest_makes_POST_request_to_specific_url_with_parameters()
         {
+            // Arrange
             var flow = new RestFlow()
                 .Post("<ok />")
-                    .ExpectUrl("https://lastpass.com/login.php")
-                    .ExpectContent("method=cli")
-                    .ExpectContent($"username={Username.EncodeUriData()}")
-                    .ExpectContent($"iterations={IterationCount}")
-                    .ExpectContent("hash=26ecd8a4442e24fde414bd0594233b1bbdb55fa410d56a5d8284a316c7298b65")
-                    .ExpectContent($"trustlabel={ClientInfo.Description}");
+                .ExpectUrl("https://lastpass.com/login.php")
+                .ExpectContent("method=cli")
+                .ExpectContent($"username={Username.EncodeUriData()}")
+                .ExpectContent($"iterations={IterationCount}")
+                .ExpectContent($"hash={KeyHash}")
+                .ExpectContent($"trustlabel={ClientInfo.Description}");
 
-            Client.PerformSingleLoginRequest(Username,
-                                             Password,
-                                             IterationCount,
-                                             new Dictionary<string, object>(),
-                                             ClientInfo,
-                                             flow.ToRestClient(BaseUrl));
+            // Act
+            var xml = await Client.PerformSingleLoginRequest(
+                Username,
+                KeyHash,
+                IterationCount,
+                MfaMethod.None,
+                true,
+                [],
+                ClientInfo,
+                flow.ToRestClient(BaseUrl),
+                CancellationToken.None
+            );
+
+            // Assert
+            xml.Should().NotBeNull();
         }
 
         [Fact]
-        public void LoginWithOtp_returns_session()
+        public async Task LoginWithOtp_returns_session()
         {
+            // Arrange
             var flow = new RestFlow().Post(OkResponse);
-            var session = Client.LoginWithOtp(Username,
-                                              Password,
-                                              DefaultKeyIterationCount,
-                                              Client.OtpMethod.GoogleAuth,
-                                              ClientInfo,
-                                              OtpProvidingUi,
-                                              flow);
 
-            AssertSessionWithPrivateKey(session);
+            // Act
+            var sessionOrMfa = await Client.LoginWithOtp(
+                Username,
+                Password,
+                DefaultKeyIterationCount,
+                MfaMethod.GoogleAuthenticator,
+                [],
+                ClientInfo,
+                GetOtpProvidingUi(),
+                flow,
+                CancellationToken.None
+            );
+
+            // Assert
+            sessionOrMfa.Switch(AssertSessionWithPrivateKey, mfa => Assert.Fail("Expected a session, but got a MFA method"));
         }
 
         [Fact]
-        public void LoginWithOtp_passes_otp_in_POST_parameters()
+        public async Task LoginWithOtp_passes_otp_in_POST_parameters()
         {
-            var flow = new RestFlow()
-                .Post(OkResponse)
-                    .ExpectContent($"otp={Otp}");
+            // Arrange
+            var flow = new RestFlow().Post(OkResponse).ExpectContent($"otp={Otp}");
 
-            Client.LoginWithOtp(Username,
-                                Password,
-                                DefaultKeyIterationCount,
-                                Client.OtpMethod.GoogleAuth,
-                                ClientInfo,
-                                OtpProvidingUi,
-                                flow);
+            // Act
+            var sessionOrMfa = await Client.LoginWithOtp(
+                Username,
+                Password,
+                DefaultKeyIterationCount,
+                MfaMethod.GoogleAuthenticator,
+                [],
+                ClientInfo,
+                GetOtpProvidingUi(),
+                flow,
+                CancellationToken.None
+            );
+
+            // Assert
+            sessionOrMfa.Switch(AssertSessionWithPrivateKey, mfa => Assert.Fail("Expected a session, but got a MFA method"));
         }
 
         [Fact]
-        public void LoginWithOtp_with_remember_me_marks_device_as_trusted()
+        public async Task LoginWithOtp_with_remember_me_marks_device_as_trusted()
         {
-            var flow = new RestFlow()
-                .Post(OkResponse)
-                    .ExpectUrl("/login.php")
-                .Post("")
-                    .ExpectUrl("/trust.php");
+            // Arrange
+            var flow = new RestFlow().Post(OkResponse).ExpectUrl("/login.php").Post("").ExpectUrl("/trust.php");
 
-            Client.LoginWithOtp(Username,
-                                Password,
-                                DefaultKeyIterationCount,
-                                Client.OtpMethod.GoogleAuth,
-                                ClientInfo,
-                                OtpProvidingWithRememberMeUi,
-                                flow);
+            // Act
+            var sessionOrMfa = await Client.LoginWithOtp(
+                Username,
+                Password,
+                DefaultKeyIterationCount,
+                MfaMethod.GoogleAuthenticator,
+                [],
+                ClientInfo,
+                GetOtpProvidingWithRememberMeUi(),
+                flow,
+                CancellationToken.None
+            );
+
+            // Assert
+            sessionOrMfa.Switch(AssertSessionWithPrivateKey, mfa => Assert.Fail("Expected a session, but got a MFA method"));
         }
 
         [Fact]
-        public void LoginWithOob_returns_session()
+        public async Task LoginWithOob_returns_session()
         {
+            // Arrange
             var flow = new RestFlow().Post(OkResponse);
-            var session = Client.LoginWithOob(Username,
-                                              Password,
-                                              DefaultKeyIterationCount,
-                                              LastPassAuthOobParameters,
-                                              ClientInfo,
-                                              WaitingForOobUi,
-                                              flow);
 
-            AssertSessionWithPrivateKey(session);
+            // Act
+            var sessionOrMfa = await Client.LoginWithOob(
+                Username,
+                Password,
+                DefaultKeyIterationCount,
+                LastPassAuthOobParameters,
+                MfaMethod.LastPassAuthenticator,
+                [],
+                ClientInfo,
+                GetWaitingForOobUi(),
+                flow,
+                null,
+                CancellationToken.None
+            );
+
+            // Assert
+            sessionOrMfa.Switch(AssertSessionWithPrivateKey, mfa => Assert.Fail("Expected a session, but got a MFA method"));
         }
 
         [Fact]
-        public void LoginWithOob_retries_after_unsuccessful_attempt()
+        public async Task LoginWithOob_retries_after_unsuccessful_attempt()
         {
+            // Arrange
             var flow = new RestFlow()
                 .Post(OobRetryResponse)
                 .Post(OkResponse)
-                    .ExpectContent("outofbandretry=1")
-                    .ExpectContent("outofbandretryid=retry-id");
+                .ExpectContent("outofbandretry=1")
+                .ExpectContent("outofbandretryid=retry-id");
 
-            var session = Client.LoginWithOob(Username,
-                                              Password,
-                                              DefaultKeyIterationCount,
-                                              LastPassAuthOobParameters,
-                                              ClientInfo,
-                                              WaitingForOobUi,
-                                              flow);
+            // Act
+            var sessionOrMfa = await Client.LoginWithOob(
+                Username,
+                Password,
+                DefaultKeyIterationCount,
+                LastPassAuthOobParameters,
+                MfaMethod.LastPassAuthenticator,
+                [],
+                ClientInfo,
+                GetWaitingForOobUi(),
+                flow,
+                null,
+                CancellationToken.None
+            );
 
-            AssertSessionWithPrivateKey(session);
+            // Assert
+            sessionOrMfa.Switch(AssertSessionWithPrivateKey, mfa => Assert.Fail("Expected a session, but got a MFA method"));
         }
 
         [Fact]
-        public void LoginWithOob_sends_otp_in_POST_parameters()
+        public async Task LoginWithOob_sends_otp_in_POST_parameters()
         {
-            var flow = new RestFlow()
-                .Post(OkResponse)
-                    .ExpectContent($"otp={Otp}");
+            // Arrange
+            var flow = new RestFlow().Post(OkResponse).ExpectContent($"otp={Otp}");
 
-            var session = Client.LoginWithOob(Username,
-                                              Password,
-                                              DefaultKeyIterationCount,
-                                              LastPassAuthOobParameters,
-                                              ClientInfo,
-                                              PasscodeProvidingOobUi,
-                                              flow);
+            // Act
+            var sessionOrMfa = await Client.LoginWithOob(
+                Username,
+                Password,
+                DefaultKeyIterationCount,
+                LastPassAuthOobParameters,
+                MfaMethod.LastPassAuthenticator,
+                [],
+                ClientInfo,
+                GetPasscodeProvidingOobUi(),
+                flow,
+                null,
+                CancellationToken.None
+            );
 
-            AssertSessionWithPrivateKey(session);
+            // Assert
+            sessionOrMfa.Switch(AssertSessionWithPrivateKey, mfa => Assert.Fail("Expected a session, but got a MFA method"));
         }
 
         [Fact]
-        public void LoginWithOob_with_remember_me_marks_device_as_trusted()
+        public async Task LoginWithOob_with_remember_me_marks_device_as_trusted()
         {
-            var flow = new RestFlow()
-                .Post(OkResponse)
-                    .ExpectUrl("/login.php")
-                .Post("")
-                    .ExpectUrl("/trust.php");
+            // Arrange
+            var flow = new RestFlow().Post(OkResponse).ExpectUrl("/login.php").Post("").ExpectUrl("/trust.php");
 
-            Client.LoginWithOob(Username,
-                                Password,
-                                DefaultKeyIterationCount,
-                                LastPassAuthOobParameters,
-                                ClientInfo,
-                                WaitingForOobWithRememberMeUi,
-                                flow);
+            // Act
+            var sessionOrMfa = await Client.LoginWithOob(
+                Username,
+                Password,
+                DefaultKeyIterationCount,
+                LastPassAuthOobParameters,
+                MfaMethod.LastPassAuthenticator,
+                [],
+                ClientInfo,
+                GetWaitingForOobWithRememberMeUi(),
+                flow,
+                null,
+                CancellationToken.None
+            );
+
+            // Assert
+            sessionOrMfa.Switch(AssertSessionWithPrivateKey, mfa => Assert.Fail("Expected a session, but got a MFA method"));
         }
 
         [Fact]
-        public void ApproveOob_calls_Ui_ApproveLastPassAuth()
+        public async Task ApproveOob_calls_Ui_ApproveLastPassAuth()
         {
-            var ui = new Mock<IUi>();
-            ui.Setup(x => x.ApproveLastPassAuth()).Returns(OobResult.Cancel);
+            // Arrange
+            var ui = GetPasscodeProvidingOobUi();
 
-            Client.ApproveOob(Username, LastPassAuthOobParameters, ui.Object, null);
+            // Act
+            await Client.ApproveOob(Username, LastPassAuthOobParameters, MfaMethod.LastPassAuthenticator, [], ui, null, null, CancellationToken.None);
 
-            ui.VerifyAll();
-        }
-
-        [Fact]
-        public void ApproveOob_calls_Ui_ApproveDuo()
-        {
-            var ui = new Mock<IUi>();
-            ui.Setup(x => x.ApproveDuo()).Returns(OobResult.Cancel);
-
-            Client.ApproveOob(Username, DuoOobParameters, ui.Object, null);
-
-            ui.VerifyAll();
-        }
-
-        [Fact]
-        public void ApproveOob_calls_Ui_ApproveSalesforceAuth()
-        {
-            var ui = new Mock<IUi>();
-            ui.Setup(x => x.ApproveSalesforceAuth()).Returns(OobResult.Cancel);
-
-            Client.ApproveOob(Username, SalesforceAuthOobParameters, ui.Object, null);
-
-            ui.VerifyAll();
+            // Assert
+            ui.ApproveLastPassAuthCalledTimes.Should().Be(1);
         }
 
         [Fact]
@@ -605,27 +980,22 @@ namespace PasswordManagerAccess.Test.LastPass
         }
 
         [Fact]
-        public void ApproveOob_throws_on_missing_method()
+        public async Task ApproveOob_throws_on_unknown_method()
         {
-            Exceptions.AssertThrowsInternalError(
-                () => Client.ApproveOob(Username, new Dictionary<string, string>(), null, null),
-                "Out of band method is not specified");
-        }
+            // Arrange/Act
+            var act = () => Client.ApproveOob(Username, [], MfaMethod.Fido2, [], null, null, null, CancellationToken.None);
 
-        [Fact]
-        public void ApproveOob_throws_on_unknown_method()
-        {
-            Exceptions.AssertThrowsUnsupportedFeature(
-                () => Client.ApproveOob(Username, new Dictionary<string, string> {["outofbandtype"] = "blah"}, null, null),
-                "Out of band method 'blah' is not supported");
+            // Assert
+            await act.Should().ThrowAsync<UnsupportedFeatureException>().WithMessage("Out of band method 'Fido2' is not supported");
         }
 
         [Theory]
         [InlineData("duo_host")]
         [InlineData("duo_signature")]
         [InlineData("duo_bytes")]
-        public void ApproveOob_throws_on_missing_duo_parameters(string name)
+        public async Task ApproveOob_throws_on_missing_duo_v1_parameters(string name)
         {
+            // Arrange
             var parameters = new Dictionary<string, string>
             {
                 ["outofbandtype"] = "duo",
@@ -636,36 +1006,70 @@ namespace PasswordManagerAccess.Test.LastPass
             };
             parameters.Remove(name);
 
-            Exceptions.AssertThrowsInternalError(() => Client.ApproveOob(Username, parameters, null, null),
-                                                 $"Invalid response: '{name}' parameter not found");
+            // Act
+            var act = () => Client.ApproveOob(Username, parameters, MfaMethod.Duo, [], null, null, null, CancellationToken.None);
+
+            // Assert
+            await act.Should().ThrowAsync<InternalErrorException>().WithMessage($"Invalid response: '{name}' parameter not found");
+        }
+
+        [Theory]
+        [InlineData("duo_session_token")]
+        [InlineData("duo_private_token")]
+        public async Task ApproveOob_throws_on_missing_duo_v4_parameters(string name)
+        {
+            // Arrange
+            var parameters = new Dictionary<string, string>
+            {
+                ["outofbandtype"] = "duo",
+                ["preferduowebsdk"] = "1",
+                ["duo_authentication_url"] = "duo-authentication-url",
+                ["duo_session_token"] = "duo-session-token",
+                ["duo_private_token"] = "duo-private-token",
+            };
+            parameters.Remove(name);
+
+            // Act
+            var act = () => Client.ApproveOob(Username, parameters, MfaMethod.Duo, [], null, null, null, CancellationToken.None);
+
+            // Assert
+            await act.Should().ThrowAsync<InternalErrorException>().WithMessage($"Invalid response: '{name}' parameter not found");
         }
 
         [Fact]
-        public void ExchangeDuoSignatureForPasscode_returns_checkduo_code()
+        public async Task ExchangeDuoSignatureForPasscode_returns_checkduo_code()
         {
+            // Arrange
             var flow = new RestFlow().Post("<ok code='blah' />");
-            var passcode = Client.ExchangeDuoSignatureForPasscode("", "", "", flow);
 
-            Assert.Equal("checkduoblah", passcode);
+            // Act
+            var passcode = await Client.ExchangeDuoSignatureForPasscode("", "", "", flow, CancellationToken.None);
+
+            // Assert
+            passcode.Should().Be("checkduoblah");
         }
 
         [Fact]
-        public void ExchangeDuoSignatureForPasscode_makes_POST_request_to_specific_url_with_parameters()
+        public async Task ExchangeDuoSignatureForPasscode_makes_POST_request_to_specific_url_with_parameters()
         {
+            // Arrange
             var salt = "salt-salt";
             var signature = "signature-signature";
-
             var flow = new RestFlow()
                 .Post("<ok code='blah' />")
-                    .ExpectUrl("https://lastpass.com/duo.php")
-                    .ExpectContent($"username={Username.EncodeUriData()}")
-                    .ExpectContent($"akey={salt}")
-                    .ExpectContent($"sig_response={signature}");
+                .ExpectUrl("https://lastpass.com/duo.php")
+                .ExpectContent($"username={Username.EncodeUriData()}")
+                .ExpectContent($"akey={salt}")
+                .ExpectContent($"sig_response={signature}");
 
-            Client.ExchangeDuoSignatureForPasscode(username: Username,
-                                                   signature: signature,
-                                                   salt: salt,
-                                                   rest: flow.ToRestClient(BaseUrl));
+            // Act/Assert
+            await Client.ExchangeDuoSignatureForPasscode(
+                username: Username,
+                signature: signature,
+                salt: salt,
+                rest: flow.ToRestClient(BaseUrl),
+                CancellationToken.None
+            );
         }
 
         [Theory]
@@ -675,10 +1079,14 @@ namespace PasswordManagerAccess.Test.LastPass
         [InlineData("<ok code='blah' more='not less'><moretags><inside /></moretags></ok>")]
         public void ExtractDuoPasscodeFromDuoResponse_returns_passcode(string response)
         {
+            // Arrange
             var xml = XDocument.Parse(response);
+
+            // Act
             var passcode = Client.ExtractDuoPasscodeFromDuoResponse(xml);
 
-            Assert.Equal("blah", passcode);
+            // Assert
+            passcode.Should().Be("blah");
         }
 
         [Theory]
@@ -690,59 +1098,72 @@ namespace PasswordManagerAccess.Test.LastPass
         [InlineData("<notok><ok code='blah' /></notok>")]
         public void ExtractDuoPasscodeFromDuoResponse_throws_on_invalid_response(string response)
         {
+            // Arrange
             var xml = XDocument.Parse(response);
 
-            Exceptions.AssertThrowsInternalError(() => Client.ExtractDuoPasscodeFromDuoResponse(xml),
-                                                 "Invalid response");
+            // Act
+            var act = () => Client.ExtractDuoPasscodeFromDuoResponse(xml);
+
+            // Assert
+            act.Should().Throw<InternalErrorException>().WithMessage("Invalid response: *");
         }
 
         [Fact]
-        public void MarkDeviceAsTrusted_makes_POST_request_to_specific_url_with_parameters_and_cookies()
+        public async Task MarkDeviceAsTrusted_makes_POST_request_to_specific_url_with_parameters_and_cookies()
         {
+            // Arrange
             var flow = new RestFlow()
                 .Post("")
-                    .ExpectUrl("https://lastpass.com/trust.php")
-                    .ExpectContent($"uuid={ClientInfo.Id}")
-                    .ExpectContent($"trustlabel={ClientInfo.Description}")
-                    .ExpectContent($"token={Session.Token}")
-                    .ExpectCookie("PHPSESSID", Session.Id);
+                .ExpectUrl("https://lastpass.com/trust.php")
+                .ExpectContent($"uuid={ClientInfo.Id}")
+                .ExpectContent($"trustlabel={ClientInfo.Description}")
+                .ExpectContent($"token={Session.Token}")
+                .ExpectCookie("PHPSESSID", Session.Id);
 
-            Client.MarkDeviceAsTrusted(Session, ClientInfo, flow.ToRestClient(BaseUrl));
+            // Act/Assert
+            await Client.MarkDeviceAsTrusted(Session, ClientInfo, flow.ToRestClient(BaseUrl), CancellationToken.None);
         }
 
         [Fact]
-        public void Logout_makes_POST_request_to_specific_url_with_parameters_and_cookies()
+        public async Task Logout_makes_POST_request_to_specific_url_with_parameters_and_cookies()
         {
+            // Arrange
             var flow = new RestFlow()
                 .Post("")
-                    .ExpectUrl("https://lastpass.com/logout.php")
-                    .ExpectContent("method=cli")
-                    .ExpectContent("noredirect=1")
-                    .ExpectCookie("PHPSESSID", Session.Id);
+                .ExpectUrl("https://lastpass.com/logout.php")
+                .ExpectContent("method=cli")
+                .ExpectContent("noredirect=1")
+                .ExpectCookie("PHPSESSID", Session.Id);
 
-            Client.Logout(Session, flow.ToRestClient(BaseUrl));
+            // Act/Assert
+            await Client.Logout(LoginState, flow.ToRestClient(BaseUrl), CancellationToken.None);
         }
 
         [Fact]
-        public void DownloadVault_returns_blob()
+        public async Task DownloadVault_returns_blob()
         {
-            var expected = "blah-blah".ToBytes();
-            var flow = new RestFlow().Get(expected.ToBase64());
-            var blob = Client.DownloadVault(Session, flow);
+            // Arrange
+            var flow = new RestFlow().Get("blah-blah".ToBytes().ToBase64());
 
-            Assert.Equal(expected, blob);
+            // Act
+            var blob = await Client.DownloadVault(LoginState, flow, CancellationToken.None);
+
+            // Assert
+            blob.Should().Equal("blah-blah".ToBytes());
         }
 
         [Fact]
-        public void DownloadVault_makes_GET_request_to_specific_url_with_cookies()
+        public async Task DownloadVault_makes_GET_request_to_specific_url_with_cookies()
         {
+            // Arrange
             var flow = new RestFlow()
                 .Get("blah-blah".ToBase64())
-                    .ExpectUrl("https://lastpass.com/getaccts.php?")
-                    .ExpectUrl("requestsrc=cli")
-                    .ExpectCookie("PHPSESSID", Session.Id);
+                .ExpectUrl("https://lastpass.com/getaccts.php?")
+                .ExpectUrl("requestsrc=cli")
+                .ExpectCookie("PHPSESSID", Session.Id);
 
-            Client.DownloadVault(Session, flow.ToRestClient(BaseUrl));
+            // Act/Assert
+            await Client.DownloadVault(LoginState, flow.ToRestClient(BaseUrl), CancellationToken.None);
         }
 
         [Theory]
@@ -750,59 +1171,81 @@ namespace PasswordManagerAccess.Test.LastPass
         [InlineData(Platform.Mobile, "android")]
         public void GetVaultEndpoint_includes_platform_in_endpoint(Platform platform, string expected)
         {
+            // Act
             var endpoint = Client.GetVaultEndpoint(platform);
 
-            Assert.Contains($"requestsrc={expected}", endpoint);
+            // Assert
+            endpoint.Should().Contain($"requestsrc={expected}");
         }
 
         [Fact]
         public void GetSessionCookies_escapes_session_id()
         {
-            var session = new Session(" /:;?=", -1, "", Platform.Desktop, "");
+            // Arrange
+            var session = new Session(" /:;?=", "", "");
+
+            // Act
             var cookies = Client.GetSessionCookies(session);
 
-            Assert.Equal("%20%2F%3A%3B%3F%3D", cookies["PHPSESSID"]);
+            // Assert
+            cookies["PHPSESSID"].Should().Be("%20%2F%3A%3B%3F%3D");
         }
 
         [Fact]
-         public void ParseXml_returns_parsed_xml()
+        public void ParseXml_returns_parsed_xml()
         {
-            var response = new RestResponse<string> {Content = "<ok />"};
+            // Arrange
+            var response = new RestResponse<string> { Content = "<ok />" };
 
-            Assert.NotNull(Client.ParseXml(response));
+            // Act
+            var xml = Client.ParseXml(response);
+
+            // Assert
+            xml.Should().NotBeNull();
         }
 
         [Fact]
         public void ParseXml_throws_on_invalid_xml()
         {
-            var response = new RestResponse<string>
-            {
-                Content = "> invalid xml <",
-                RequestUri = new Uri("https://int.er.net")
-            };
+            // Arrange
+            var response = new RestResponse<string> { Content = "> invalid xml <", RequestUri = new Uri("https://int.er.net") };
 
-            Exceptions.AssertThrowsInternalError(
-                () => Client.ParseXml(response),
-                "Failed to parse XML in response from https://int.er.net");
+            // Act
+            var act = () => Client.ParseXml(response);
+
+            // Assert
+            act.Should().Throw<InternalErrorException>().WithMessage("Failed to parse XML in response from https://int.er.net/");
         }
 
-        [Fact]
-        public void ExtractSessionFromLoginResponse_returns_session()
+        [Theory]
+        [InlineData(OkElement)]
+        [InlineData(OkResponse)]
+        public void ExtractSessionFromLoginResponse_returns_session(string response)
         {
-            var xml = XDocument.Parse(OkResponse);
-            var session = Client.ExtractSessionFromLoginResponse(xml, DefaultKeyIterationCount, ClientInfo);
+            // Arrange
+            var xml = XDocument.Parse(response);
 
+            // Act
+            var session = Client.ExtractSessionFromLoginResponse(xml);
+
+            // Assert
             AssertSessionWithPrivateKey(session);
         }
 
         [Theory]
+        [InlineData(OkElementNoPrivateKey)]
         [InlineData(OkResponseNoPrivateKey)]
+        [InlineData(OkElementBlankPrivateKey)]
         [InlineData(OkResponseBlankPrivateKey)]
         public void ExtractSessionFromLoginResponse_returns_session_without_private_key(string response)
         {
+            // Arrange
             var xml = XDocument.Parse(response);
-            var session = Client.ExtractSessionFromLoginResponse(xml, DefaultKeyIterationCount, ClientInfo);
 
+            // Act
+            var session = Client.ExtractSessionFromLoginResponse(xml);
+
+            // Assert
             AssertSessionWithoutPrivateKey(session);
         }
 
@@ -811,39 +1254,59 @@ namespace PasswordManagerAccess.Test.LastPass
         [InlineData("<response><error blah='blah-blah' /></response>", "blah-blah")]
         public void GetErrorAttribute_returns_attribute_value(string response, string expected)
         {
+            // Arrange
             var xml = XDocument.Parse(response);
+
+            // Act
             var value = Client.GetErrorAttribute(xml, "blah");
 
-            Assert.Equal(expected, value);
+            // Assert
+            value.Should().Be(expected);
         }
 
         [Fact]
         public void GetErrorAttribute_throws_when_attribute_is_not_present()
         {
+            // Arrange
             var xml = XDocument.Parse("<response><error blah='blah-blah' /></response>");
 
-            Exceptions.AssertThrowsInternalError(
-                () => Client.GetErrorAttribute(xml, "poof"),
-                "Unknown response schema: attribute 'poof' is missing");
+            // Act
+            var act = () => Client.GetErrorAttribute(xml, "poof");
+
+            // Assert
+            act.Should().Throw<InternalErrorException>().WithMessage("Unknown response schema: attribute 'poof' is missing");
         }
 
         [Fact]
         public void GetOptionalErrorAttribute_returns_null_when_attribute_is_not_present()
         {
+            // Arrange
             var xml = XDocument.Parse("<response><error blah='blah-blah' /></response>");
+
+            // Act
             var value = Client.GetOptionalErrorAttribute(xml, "poof");
 
-            Assert.Null(value);
+            // Assert
+            value.Should().BeNull();
         }
 
         [Fact]
         public void GetAllErrorAttributes_returns_all_names_and_values()
         {
-            var expected = new Dictionary<string, string> {["a"] = "b", ["c"] = "d", ["e"] = "f"};
+            // Arrange
+            var expected = new Dictionary<string, string>
+            {
+                ["a"] = "b",
+                ["c"] = "d",
+                ["e"] = "f",
+            };
+
+            // Act
             var xml = XDocument.Parse("<response><error a='b' c='d' e='f' /></response>");
             var all = Client.GetAllErrorAttributes(xml);
 
-            Assert.Equal(expected, all);
+            // Assert
+            all.Should().Equal(expected);
         }
 
         // TODO: Figure out how to test this!
@@ -855,20 +1318,21 @@ namespace PasswordManagerAccess.Test.LastPass
         [Fact]
         public void ParseVault_returns_vault_with_correct_accounts()
         {
-            var accounts = Client.ParseVault(Blob,
-                                             TestData.EncryptionKey,
-                                             TestData.PrivateKey,
-                                             ParserOptions.Default);
+            // Arrange/Act
+            var accounts = Client.ParseVault(Blob, TestData.EncryptionKey, TestData.PrivateKey, ParserOptions.Default);
 
-            Assert.True(accounts.Length >= TestData.Accounts.Length);
+            // Assert
+            accounts.Length.Should().BeGreaterOrEqualTo(TestData.Accounts.Length);
             for (var i = 0; i < TestData.Accounts.Length; i++)
             {
-                Assert.Equal(TestData.Accounts[i].Id, accounts[i].Id);
-                Assert.Equal(TestData.Accounts[i].Name, accounts[i].Name);
-                Assert.Equal(TestData.Accounts[i].Username, accounts[i].Username);
-                Assert.Equal(TestData.Accounts[i].Password, accounts[i].Password);
-                Assert.Equal(TestData.Accounts[i].Url, accounts[i].Url);
-                Assert.Equal(TestData.Accounts[i].Group, accounts[i].Path);
+                var account = TestData.Accounts[i];
+
+                accounts[i].Id.Should().Be(account.Id);
+                accounts[i].Name.Should().Be(account.Name);
+                accounts[i].Username.Should().Be(account.Username);
+                accounts[i].Password.Should().Be(account.Password);
+                accounts[i].Url.Should().Be(account.Url);
+                accounts[i].Path.Should().Be(account.Group);
             }
         }
 
@@ -883,70 +1347,156 @@ namespace PasswordManagerAccess.Test.LastPass
         [InlineData(1000)]
         public void ParseVault_throws_on_truncated_blob(int cut)
         {
-            Exceptions.AssertThrowsInternalError(
-                () => Client.ParseVault(Blob.Sub(0, Blob.Length - cut),
-                                        TestData.EncryptionKey,
-                                        TestData.PrivateKey,
-                                        ParserOptions.Default),
-                "Blob is truncated or corrupted");
+            // Arrange/Act
+            var act = () => Client.ParseVault(Blob.Sub(0, Blob.Length - cut), TestData.EncryptionKey, TestData.PrivateKey, ParserOptions.Default);
+
+            // Assert
+            act.Should().Throw<InternalErrorException>().WithMessage("Blob is truncated or corrupted");
         }
 
         //
         // Helpers
         //
 
-        private class FakeUi: IUi
+        private class FakeSecureLogger : ISecureLogger
         {
-            public FakeUi(OtpResult otp, OobResult oob)
+            public List<LogEntry> Entries { get; } = [];
+
+            public void Log(LogEntry entry) => Entries.Add(entry);
+        }
+
+        private class FakeUi(OneOf<Otp, MfaMethod, Canceled> otp, OneOf<Otp, WaitForOutOfBand, MfaMethod, Canceled> oob) : IAsyncUi
+        {
+            public int ProvideGoogleAuthPasscodeCalledTimes { get; private set; }
+            public int ProvideMicrosoftAuthPasscodeCalledTimes { get; private set; }
+            public int ProvideYubikeyPasscodeCalledTimes { get; private set; }
+            public int ApproveLastPassAuthCalledTimes { get; private set; }
+            public int ChooseDuoFactorCalledTimes { get; private set; }
+            public int ProvideDuoPasscodeCalledTimes { get; private set; }
+            public int DuoDoneCalledTimes { get; private set; }
+            public int UpdateDuoStatusCalledTimes { get; private set; }
+
+            public Task<OneOf<Otp, MfaMethod, Canceled>> ProvideGoogleAuthPasscode(
+                int attempt,
+                MfaMethod[] otherMethods,
+                CancellationToken cancellationToken
+            )
             {
-                _otp = otp;
-                _oob = oob;
+                ProvideGoogleAuthPasscodeCalledTimes++;
+                return Task.FromResult(otp);
             }
 
-            public OtpResult ProvideGoogleAuthPasscode() => _otp;
-            public OtpResult ProvideMicrosoftAuthPasscode() => _otp;
-            public OtpResult ProvideYubikeyPasscode() => _otp;
-            public OobResult ApproveLastPassAuth() => _oob;
-            public OobResult ApproveDuo() => _oob;
-            public OobResult ApproveSalesforceAuth() => _oob;
-
-            public DuoChoice ChooseDuoFactor(DuoDevice[] devices)
+            public Task<OneOf<Otp, MfaMethod, Canceled>> ProvideMicrosoftAuthPasscode(
+                int attempt,
+                MfaMethod[] otherMethods,
+                CancellationToken cancellationToken
+            )
             {
-                return new DuoChoice(new DuoDevice("id", "name", new[] {DuoFactor.Push}),
-                                     DuoFactor.Push,
-                                     false);
+                ProvideMicrosoftAuthPasscodeCalledTimes++;
+                return Task.FromResult(otp);
             }
 
-            public string ProvideDuoPasscode(DuoDevice device)
+            public Task<OneOf<Otp, MfaMethod, Canceled>> ProvideYubikeyPasscode(
+                int attempt,
+                MfaMethod[] otherMethods,
+                CancellationToken cancellationToken
+            )
             {
-                return "passcode";
+                ProvideYubikeyPasscodeCalledTimes++;
+                return Task.FromResult(otp);
             }
 
-            public void UpdateDuoStatus(DuoStatus status, string text)
+            public Task<OneOf<Otp, WaitForOutOfBand, MfaMethod, Canceled>> ApproveLastPassAuth(
+                int attempt,
+                MfaMethod[] otherMethods,
+                CancellationToken cancellationToken
+            )
             {
+                ApproveLastPassAuthCalledTimes++;
+                return Task.FromResult(oob);
             }
 
-            private readonly OtpResult _otp;
-            private readonly OobResult _oob;
+            public Task<OneOf<string, Canceled>> PerformSsoLogin(string url, string expectedRedirectUrl, CancellationToken cancellationToken)
+            {
+                throw new NotImplementedException();
+            }
+
+            public Task<OneOf<DuoChoice, MfaMethod, DuoCancelled>> ChooseDuoFactor(
+                DuoDevice[] devices,
+                MfaMethod[] otherMethods,
+                CancellationToken cancellationToken
+            )
+            {
+                ChooseDuoFactorCalledTimes++;
+                return Task.FromResult<OneOf<DuoChoice, MfaMethod, DuoCancelled>>(
+                    new DuoChoice(new DuoDevice("id", "name", [DuoFactor.Push]), DuoFactor.Push, false)
+                );
+            }
+
+            public Task<OneOf<DuoPasscode, DuoCancelled>> ProvideDuoPasscode(DuoDevice device, CancellationToken cancellationToken)
+            {
+                ProvideDuoPasscodeCalledTimes++;
+                return Task.FromResult<OneOf<DuoPasscode, DuoCancelled>>(new DuoPasscode("passcode"));
+            }
+
+            public Task DuoDone(CancellationToken cancellationToken)
+            {
+                DuoDoneCalledTimes++;
+                return Task.CompletedTask;
+            }
+
+            public Task UpdateDuoStatus(DuoStatus status, string text, CancellationToken cancellationToken)
+            {
+                UpdateDuoStatusCalledTimes++;
+                return Task.CompletedTask;
+            }
+        }
+
+        // OTP and OOB
+        private static FakeUi GetCancelingUi() => new(new Canceled("User cancelled"), new Canceled("User cancelled"));
+
+        // OTP only
+        private static FakeUi GetOtpProvidingUi() => new(new Otp(Otp, false), new Canceled("User cancelled"));
+
+        private static FakeUi GetOtpProvidingWithRememberMeUi() => new(new Otp(Otp, true), new Canceled("User cancelled"));
+
+        // OOB only
+        private static FakeUi GetWaitingForOobUi() => new(new Canceled("User cancelled"), new WaitForOutOfBand(false));
+
+        private static FakeUi GetWaitingForOobWithRememberMeUi() => new(new Canceled("User cancelled"), new WaitForOutOfBand(true));
+
+        private static FakeUi GetPasscodeProvidingOobUi() => new(new Canceled("User cancelled"), new Otp(Otp, false));
+
+        private static void AssertLoginStateWithPrivateKey(Client.LoginState state)
+        {
+            AssertSessionWithPrivateKey(state.Session);
+            state.Platform.Should().Be(Platform.Desktop);
+            state.EncryptionKey.Should().NotBeEmpty();
+        }
+
+        private static void AssertLoginStateWithoutPrivateKey(Client.LoginState state)
+        {
+            AssertSessionWithoutPrivateKey(state.Session);
+            state.Platform.Should().Be(Platform.Desktop);
+            state.EncryptionKey.Should().Equal(TestData.EncryptionKey);
         }
 
         private static void AssertSessionWithPrivateKey(Session session)
         {
             AssertSessionCommon(session);
-            Assert.Equal("private-key", session.EncryptedPrivateKey);
+            session.EncryptedPrivateKey.Should().Be("private-key");
         }
 
         private static void AssertSessionWithoutPrivateKey(Session session)
         {
             AssertSessionCommon(session);
-            Assert.Null(session.EncryptedPrivateKey);
+            session.EncryptedPrivateKey.Should().BeNull();
         }
 
         private static void AssertSessionCommon(Session session)
         {
-            Assert.Equal("session-id", session.Id);
-            Assert.Equal("token", session.Token);
-            Assert.Equal(Platform.Desktop, session.Platform);
+            session.Id.Should().Be("session-id");
+            session.Token.Should().Be("token");
         }
 
         //
@@ -960,90 +1510,163 @@ namespace PasswordManagerAccess.Test.LastPass
         private const string AlternativeBaseUrl = "https://lastpass.eu";
         private const string Username = "lastpass.ruby@gmail.com";
         private const string Password = "&nT%*pMWJb*7s6u1";
+        private const string KeyHash = "deadbeef";
         private const int IterationCount = 5000;
         private const string Otp = "123456";
         private const int DefaultKeyIterationCount = 100100;
 
-        private static readonly ClientInfo ClientInfo = new ClientInfo(Platform.Desktop,
-                                                                       "client-id",
-                                                                       "description");
+        private static readonly ClientInfo ClientInfo = new(Platform.Desktop, "client-id", "description");
+        private static readonly Session Session = new("session-id", "token", "private-key");
+        private static readonly Client.LoginState LoginState = new(Session, Platform.Desktop, TestData.EncryptionKey);
 
-        private static readonly Session Session = new Session("session-id",
-                                                              IterationCount,
-                                                              "token",
-                                                              Platform.Desktop,
-                                                              "private-key");
+        private static readonly Dictionary<string, string> LastPassAuthOobParameters = new() { ["outofbandtype"] = "lastpassauth" };
 
-        private static readonly Dictionary<string, string> LastPassAuthOobParameters = new Dictionary<string, string>
-        {
-            ["outofbandtype"] = "lastpassauth"
-        };
+        private static readonly Dictionary<string, string> DuoOobParameters = new() { ["outofbandtype"] = "duo" };
 
-        private static readonly Dictionary<string, string> DuoOobParameters = new Dictionary<string, string>
-        {
-            ["outofbandtype"] = "duo"
-        };
+        //private static readonly Dictionary<string, string> DuoOobParameters = new() { ["outofbandtype"] = "duo", ["preferduowebsdk"] = "1" };
 
-        private static readonly Dictionary<string, string> SalesforceAuthOobParameters = new Dictionary<string, string>
-        {
-            ["outofbandtype"] = "salesforcehash"
-        };
-
-        // OTP and OOB
-        private static readonly IUi CancelingUi = new FakeUi(OtpResult.Cancel, OobResult.Cancel);
-
-        // OTP only
-        private static readonly IUi OtpProvidingUi = new FakeUi(new OtpResult(Otp, false), null);
-        private static readonly IUi OtpProvidingWithRememberMeUi = new FakeUi(new OtpResult(Otp, true), null);
-
-        // OOB only
-        private static readonly IUi WaitingForOobUi = new FakeUi(null, OobResult.WaitForApproval(false));
-        private static readonly IUi WaitingForOobWithRememberMeUi = new FakeUi(null, OobResult.WaitForApproval(true));
-        private static readonly IUi PasscodeProvidingOobUi = new FakeUi(null, OobResult.ContinueWithPasscode(Otp, false));
+        private static readonly string RegularLoginResponse = """
+            {
+                "type": 0
+            }
+            """;
 
         private static readonly string OkResponseValidPrivateKey =
-            "<response>" +
-                $"<ok sessionid='session-id' token='token' iterations='{IterationCount}' privatekeyenc='{TestData.EncryptedPrivateKey}' />" +
-             "</response>";
+            "<response>"
+            + $"<ok sessionid='session-id' token='token' iterations='{IterationCount}' privatekeyenc='{TestData.EncryptedPrivateKey}' />"
+            + "</response>";
 
-        private const string OkResponse =
-            "<response>" +
-                "<ok sessionid='session-id' token='token' privatekeyenc='private-key' />" +
-             "</response>";
+        private const string OkElement = "<ok sessionid='session-id' token='token' privatekeyenc='private-key' />";
+        private const string OkElementNoPrivateKey = "<ok sessionid='session-id' token='token' />";
+        private const string OkElementBlankPrivateKey = "<ok sessionid='session-id' token='token' privatekeyenc='' />";
 
-        private const string OkResponseNoPrivateKey =
-            "<response>" +
-                "<ok sessionid='session-id' token='token' />" +
-             "</response>";
+        private const string OkResponse = "<response>" + OkElement + "</response>";
+        private const string OkResponseNoPrivateKey = "<response>" + OkElementNoPrivateKey + "</response>";
+        private const string OkResponseBlankPrivateKey = "<response>" + OkElementBlankPrivateKey + "</response>";
 
-        private const string OkResponseBlankPrivateKey =
-            "<response>" +
-                "<ok sessionid='session-id' token='token' privatekeyenc='' />" +
-             "</response>";
+        private const string OtpRequiredResponse = "<response>" + "<error cause='googleauthrequired' />" + "</response>";
 
-        private const string OtpRequiredResponse =
-            "<response>" +
-                "<error cause='googleauthrequired' />" +
-            "</response>";
+        private const string OobRequiredResponse = "<response>" + "<error cause='outofbandrequired' outofbandtype='lastpassauth' />" + "</response>";
 
-        private const string OobRequiredResponse =
-            "<response>" +
-                "<error cause='outofbandrequired' outofbandtype='lastpassauth' />" +
-            "</response>";
+        private const string DuoV4RequiredResponse = """
+            <response>
+                <error cause="outofbandrequired"
+                       outofbandtype="duo"
+                       preferduowebsdk="1"
+                       duo_authentication_url="https://duo.url?sid=duo_sid"
+                       duo_session_token="session_token"
+                       duo_private_token="private_token"
+                />
+            </response>
+            """;
 
-        private const string OobRetryResponse =
-            "<response>" +
-                "<error cause='outofbandrequired' retryid='retry-id' />" +
-            "</response>";
+        private const string OobRetryResponse = "<response>" + "<error cause='outofbandrequired' retryid='retry-id' />" + "</response>";
 
-        private static readonly string IterationResponse =
-            "<response>" +
-                $"<error iterations='{IterationCount}' />" +
-            "</response>";
+        private static readonly string IterationResponse = "<response>" + $"<error iterations='{IterationCount}' />" + "</response>";
 
         private const string ServerResponse =
-            "<response>" +
-                "<error server='lastpass.eu' message='our princess is in another castle' />" +
-            "</response>";
+            "<response>" + "<error server='lastpass.eu' message='our princess is in another castle' />" + "</response>";
+
+        private const string OtpFailedResponse = """
+            <response>
+                <error cause="googleauthfailed" />
+            </response>
+            """;
+    }
+
+    internal static class RestFlowDuoExtensions
+    {
+        // TODO: Move this part to DuoV4Test
+        public static RestFlow Duo(this RestFlow flow)
+        {
+            return flow.Get(DuoMainHtmlResponse) // Duo: main frame
+                .Post("") // Duo: submit system parameters
+                .Get(DuoDevicesResponse) // Duo: get devices
+                .Post(DuoSubmitFactorResponse) // Duo:
+                .Post(DuoStatusSuccessResponse)
+                .Post("", responseUrl: "https://duo.done?code=duo_code&state=duo_state");
+        }
+
+        public static RestFlow LastPassDuo(this RestFlow flow)
+        {
+            return flow.Duo().Post(LmiapiDuoResponse);
+        }
+
+        private const string DuoMainHtmlResponse = """
+            <html>
+                <body>
+                    <form id="plugin_form">
+                        <input name="_xsrf" value="duo_xsrf" />
+                    </form>
+                </body>
+            </html>
+            """;
+
+        private const string DuoDevicesResponse = """
+            {
+                "stat": "OK",
+                "response": {
+                    "phones": [
+                        {
+                            "key": "PHONE1",
+                            "name": "Phone 1",
+                            "sms_batch_size": 10,
+                            "next_passcode": "1",
+                            "index": "phone1",
+                            "requires_compliance_text": true,
+                            "keypress_confirm": "",
+                            "end_of_number": "1111",
+                            "mobile_otpable": true
+                        },
+                        {
+                            "key": "PHONE2",
+                            "name": "Phone 2",
+                            "sms_batch_size": 10,
+                            "next_passcode": "1",
+                            "index": "phone2",
+                            "requires_compliance_text": true,
+                            "keypress_confirm": "",
+                            "end_of_number": "2222",
+                            "mobile_otpable": true
+                        }
+                    ],
+                    "auth_method_order": [
+                        { "deviceKey": "PHONE1", "factor": "Duo Push" },
+                        { "deviceKey": "PHONE2", "factor": "Duo Push" },
+                        { "deviceKey": "PHONE1", "factor": "SMS Passcode" },
+                        { "deviceKey": "PHONE2", "factor": "SMS Passcode" },
+                        { "deviceKey": "PHONE1", "factor": "Phone Call" },
+                        { "deviceKey": "PHONE2", "factor": "Phone Call" }
+                    ]
+                }
+            }
+            """;
+
+        private const string DuoSubmitFactorResponse = """
+            {
+                "stat": "OK",
+                "response": {
+                    "txid": "duo_txid"
+                }
+            }
+            """;
+
+        private const string DuoStatusSuccessResponse = """
+            {
+                "stat": "OK",
+                "response": {
+                    "status_code": "allow",
+                    "result": "SUCCESS",
+                    "reason": "User approved",
+                }
+            }
+            """;
+
+        private const string LmiapiDuoResponse = """
+            {
+                "status": "allowed",
+                "oneTimeToken": "duo_one_time_token"
+            }
+            """;
     }
 }

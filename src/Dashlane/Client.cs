@@ -12,16 +12,13 @@ namespace PasswordManagerAccess.Dashlane
 {
     internal static class Client
     {
-        public static (R.Vault Vault, string ServerKey) OpenVault(string username, 
-                                                                  Ui ui, 
-                                                                  ISecureStorage storage, 
-                                                                  IRestTransport transport)
+        public static (R.Vault Vault, string ServerKey) OpenVault(string username, Ui ui, ISecureStorage storage, IRestTransport transport)
         {
             // Dashlane requires a registered known to the server device ID (UKI) to access the vault. When there's no
             // UKI available we need to initiate a login sequence with a forced OTP.
             var uki = storage.LoadString(DeviceUkiKey);
-            
-            // Server key is a server provided part of the password used in the vault decryptioin.
+
+            // Server key is a server provided part of the password used in the vault decryption.
             var serverKey = "";
 
             // Give 2 attempts max
@@ -32,10 +29,10 @@ namespace PasswordManagerAccess.Dashlane
                 if (uki.IsNullOrEmpty())
                 {
                     var registerResult = RegisterNewDeviceWithMultipleAttempts(username, ui, transport);
-                    
+
                     uki = registerResult.Uki;
                     serverKey = registerResult.ServerKey;
-                    
+
                     if (registerResult.RememberMe)
                         storage.StoreString(DeviceUkiKey, uki);
 
@@ -78,23 +75,23 @@ namespace PasswordManagerAccess.Dashlane
         }
 
         // Returns a valid UKI and "remember me"
-        internal static RegisterResult RegisterNewDeviceWithMultipleAttempts(string username,
-                                                                             Ui ui,
-                                                                             IRestTransport transport)
+        internal static RegisterResult RegisterNewDeviceWithMultipleAttempts(string username, Ui ui, IRestTransport transport)
         {
-            var rest = new RestClient(transport,
-                                      AuthApiBaseUrl,
-                                      new Dl1RequestSigner(),
-                                      defaultHeaders: new Dictionary<string, string>(2)
-                                      {
-                                          ["Dashlane-Client-Agent"] = ClientAgent,
-                                          ["User-Agent"] = UserAgent,
-                                      });
+            var rest = new RestClient(
+                transport,
+                AuthApiBaseUrl,
+                new Dl1RequestSigner(),
+                defaultHeaders: new Dictionary<string, string>(2) { ["Dashlane-Client-Agent"] = ClientAgent, ["User-Agent"] = UserAgent }
+            );
 
             var mfaMethods = RequestDeviceRegistration(username, rest);
             var mfaMethod = ChooseMfaMethod(mfaMethods);
 
-            for (var attempt = 0;; attempt++)
+            // When email 2FA is selected we need to tell the server to send the token to the user
+            if (mfaMethod == MfaMethod.Email)
+                TriggerEmailToken(username, rest);
+
+            for (var attempt = 0; ; attempt++)
             {
                 var code = mfaMethod switch
                 {
@@ -106,41 +103,80 @@ namespace PasswordManagerAccess.Dashlane
                 if (code == Ui.Passcode.Cancel)
                     throw new CanceledMultiFactorException("MFA canceled by the user");
 
+                if (code == Ui.Passcode.Resend)
+                {
+                    if (mfaMethod == MfaMethod.Email)
+                    {
+                        TriggerEmailToken(username, rest);
+                        --attempt; // There was no attempt yet, we're just resending the token
+                        continue;
+                    }
+
+                    throw new InternalErrorException("Return value Resend is invalid in this context");
+                }
+
+                // Both the email token and the GA OTP are 6 digits long. When we have something else the server
+                // returns a "malformed request" error. It's hard to distinguish a legitimately malformed request
+                // and a wrong code. So we make sure it's always 6 digits before we send it to the server.
+                switch (mfaMethod)
+                {
+                    case MfaMethod.Email:
+                    case MfaMethod.Otp:
+                        if (!(code.Code.Length == 6 && code.Code.All(char.IsDigit)))
+                        {
+                            --attempt; // There was no attempt yet, we're re-requesting the code from the user
+                            continue;
+                        }
+                        break;
+
+                    // Future proofing
+                    default:
+                        throw new InternalErrorException("Logical error");
+                }
+
+                string ticket;
                 try
                 {
-                    var ticket = mfaMethod switch
+                    ticket = mfaMethod switch
                     {
                         MfaMethod.Email => SubmitEmailToken(username, code.Code, rest),
                         MfaMethod.Otp => SubmitOtpToken(username, code.Code, rest),
                         _ => throw new InternalErrorException("Logical error"),
                     };
-
-                    var info = RegisterDevice(username, ticket, code.RememberMe, rest);
-                    return new RegisterResult($"{info.AccessKey}-{info.SecretKey}",
-                                              info.ServerKey ?? "",
-                                              code.RememberMe);
                 }
                 catch (BadMultiFactorException) when (attempt < MaxMfaAttempts - 1)
                 {
                     // Do nothing, try again
+                    continue;
                 }
+
+                var info = RegisterDevice(username, ticket, code.RememberMe, rest);
+                return new RegisterResult($"{info.AccessKey}-{info.SecretKey}", info.ServerKey ?? "", code.RememberMe);
             }
         }
 
         internal static R.VerificationMethod[] RequestDeviceRegistration(string username, RestClient rest)
         {
-            return PostJson<R.VerificationMethods>("RequestDeviceRegistration",
-                                                   new Dictionary<string, object>
-                                                   {
-                                                       ["login"] = username,
-                                                   },
-                                                   rest).Methods;
+            return PostJson<R.VerificationMethods>(
+                "GetAuthenticationMethodsForDevice",
+                new Dictionary<string, object>
+                {
+                    ["login"] = username,
+                    ["methods"] = new[] { "email_token", "totp", "duo_push", "dashlane_authenticator", "u2f" },
+                },
+                rest
+            ).Methods;
+        }
+
+        internal static void TriggerEmailToken(string username, RestClient rest)
+        {
+            PostJson<R.Blank>("RequestEmailTokenVerification", new Dictionary<string, object> { ["login"] = username }, rest);
         }
 
         private enum MfaMethod
         {
             Email,
-            Otp
+            Otp,
         }
 
         private static MfaMethod ChooseMfaMethod(R.VerificationMethod[] mfaMethods)
@@ -154,61 +190,57 @@ namespace PasswordManagerAccess.Dashlane
             if (mfaMethods.Any(x => x.Name == "email_token"))
                 return MfaMethod.Email;
 
-
             var names = mfaMethods.Select(x => x.Name).JoinToString(", ");
             throw new UnsupportedFeatureException($"None of the [{names}] MFA methods are supported");
         }
 
         internal static string SubmitEmailToken(string username, string token, RestClient rest)
         {
-            return PostJson<R.AuthTicket>("PerformEmailTokenVerification",
-                                          new Dictionary<string, object>
-                                          {
-                                              ["login"] = username,
-                                              ["token"] = token,
-                                          },
-                                          rest).Ticket;
+            return PostJson<R.AuthTicket>(
+                "PerformEmailTokenVerification",
+                new Dictionary<string, object> { ["login"] = username, ["token"] = token },
+                rest
+            ).Ticket;
         }
 
         internal static string SubmitOtpToken(string username, string token, RestClient rest)
         {
-            return PostJson<R.AuthTicket>("PerformTotpVerification",
-                                          new Dictionary<string, object>
-                                          {
-                                              ["login"] = username,
-                                              ["otp"] = token,
-                                          },
-                                          rest).Ticket;
+            return PostJson<R.AuthTicket>(
+                "PerformTotpVerification",
+                new Dictionary<string, object> { ["login"] = username, ["otp"] = token },
+                rest
+            ).Ticket;
         }
 
         internal static R.DeviceInfo RegisterDevice(string username, string ticket, bool rememberMe, RestClient rest)
         {
-            return PostJson<R.DeviceInfo>("CompleteDeviceRegistrationWithAuthTicket",
-                                          new Dictionary<string, object>
-                                          {
-                                              ["login"] = username,
-                                              ["authTicket"] = ticket,
-                                              ["device"] = new Dictionary<string, object>
-                                              {
-                                                  ["appVersion"] = AppVersion,
-                                                  ["deviceName"] = ClientName,
-                                                  ["osCountry"] = "US",
-                                                  ["osLanguage"] = "en-US",
-                                                  ["platform"] = Platform,
-                                                  ["temporary"] = !rememberMe,
-                                              },
-                                          },
-                                          rest);
+            return PostJson<R.DeviceInfo>(
+                "CompleteDeviceRegistrationWithAuthTicket",
+                new Dictionary<string, object>
+                {
+                    ["login"] = username,
+                    ["authTicket"] = ticket,
+                    ["device"] = new Dictionary<string, object>
+                    {
+                        ["appVersion"] = AppVersion,
+                        ["deviceName"] = ClientName,
+                        ["osCountry"] = "US",
+                        ["osLanguage"] = "en-US",
+                        ["platform"] = Platform,
+                        ["temporary"] = !rememberMe,
+                    },
+                },
+                rest
+            );
         }
 
         internal static T PostJson<T>(string endpoint, Dictionary<string, object> parameters, RestClient rest)
         {
-            var response = rest.PostJson<R.Envelope<T>>(endpoint,
-                                                        parameters,
-                                                        headers: new Dictionary<string, string>
-                                                        {
-                                                            ["Accept"] = "application/json",
-                                                        });
+            var response = rest.PostJson<R.Envelope<T>>(
+                endpoint,
+                parameters,
+                headers: new Dictionary<string, string> { ["Accept"] = "application/json" }
+            );
 
             if (response.IsSuccessful)
                 return response.Data.Data;
@@ -235,8 +267,7 @@ namespace PasswordManagerAccess.Dashlane
             throw MakeSpecializedError(response, TryParseFetchError);
         }
 
-        internal static BaseException MakeSpecializedError(RestResponse<string> response,
-                                                           Func<RestResponse<string>, BaseException> parseError)
+        internal static BaseException MakeSpecializedError(RestResponse<string> response, Func<RestResponse<string>, BaseException> parseError)
         {
             var uri = response.RequestUri;
 
@@ -250,12 +281,9 @@ namespace PasswordManagerAccess.Dashlane
 
             // The original JSON didn't parse either. This is usually due to changed format.
             if (response.Error is JsonException)
-                return new InternalErrorException(
-                    $"Failed to parse JSON response from {uri} (HTTP status: ${response.StatusCode})",
-                    response.Error);
+                return new InternalErrorException($"Failed to parse JSON response from {uri} (HTTP status: ${response.StatusCode})", response.Error);
 
-            return new InternalErrorException($"Unexpected response from {uri} (HTTP status: ${response.StatusCode})",
-                                              response.Error);
+            return new InternalErrorException($"Unexpected response from {uri} (HTTP status: ${response.StatusCode})", response.Error);
         }
 
         internal static BaseException TryParseAuthError(RestResponse<string> response)
@@ -277,12 +305,12 @@ namespace PasswordManagerAccess.Dashlane
             var error = errorResponse.Errors[0];
             switch (error.Code)
             {
-            case "user_not_found":
-                return new BadCredentialsException($"Invalid username: '{error.Message}'");
-            case "verification_failed":
-                return new BadMultiFactorException($"MFA failed: '{error.Message}'");
-            default:
-                return new InternalErrorException($"Request failed with error: '{error.Message}'");
+                case "user_not_found":
+                    return new BadCredentialsException($"Invalid username: '{error.Message}'");
+                case "verification_failed":
+                    return new BadMultiFactorException($"MFA failed: '{error.Message}'");
+                default:
+                    return new InternalErrorException($"Request failed with error: '{error.Message}'");
             }
         }
 
@@ -312,13 +340,14 @@ namespace PasswordManagerAccess.Dashlane
 
         private const string AuthApiBaseUrl = "https://api.dashlane.com/v1/authentication/";
         private const string FetchBaseApiUrl = "https://ws1.dashlane.com/";
-        private const string UserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/105.0.0.0 Safari/537.36";
+        private const string UserAgent =
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36";
         private const string DeviceUkiKey = "device-uki";
-        private const string AppVersion = "6.2236.11";
-        private const string Platform = "server_standalone";
+        private const string AppVersion = "6.2450-prod-webapp-92fd706a";
+        private const string Platform = "server_leeloo";
         private const string ClientName = "Chrome - Mac OS (PMA)";
         private const int MaxMfaAttempts = 3;
-        private static readonly string ClientAgent = $"{{\"platform\":\"{Platform}\",\"version\":\"{AppVersion}\"}}";
-
+        private static readonly string ClientAgent =
+            $"{{\"platform\":\"{Platform}\",\"version\":\"{AppVersion}\",\"osversion\":\"OS_X_10_15_7\",\"language\":\"en\"}}";
     }
 }

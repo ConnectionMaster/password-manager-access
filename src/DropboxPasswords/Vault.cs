@@ -1,6 +1,7 @@
 // Copyright (C) Dmitry Yakimenko (detunized@gmail.com).
 // Licensed under the terms of the MIT license. See LICENCE for details.
 
+using System;
 using PasswordManagerAccess.Common;
 
 #nullable enable
@@ -11,10 +12,20 @@ namespace PasswordManagerAccess.DropboxPasswords
     {
         public readonly Account[] Accounts;
 
-        public static Vault Open(string oauthToken, string[] recoveryWords)
+        public static Vault Open(ClientInfo clientInfo, IUi ui, ISecureStorage storage)
+        {
+            return Open(clientInfo, Array.Empty<string>(), ui, storage);
+        }
+
+        public static Vault Open(ClientInfo clientInfo, string[] recoveryWords, IUi ui, ISecureStorage storage)
         {
             using var transport = new RestTransport();
-            return Open(oauthToken, recoveryWords, transport);
+            return new Vault(Client.OpenVault(clientInfo, recoveryWords, ui, storage, transport));
+        }
+
+        public static string GenerateRandomDeviceId()
+        {
+            return Guid.NewGuid().ToString().ToUpper();
         }
 
         //
@@ -24,11 +35,6 @@ namespace PasswordManagerAccess.DropboxPasswords
         internal Vault(Account[] accounts)
         {
             Accounts = accounts;
-        }
-
-        internal static Vault Open(string oauthToken, string[] recoveryWords, IRestTransport transport)
-        {
-            return new Vault(Client.OpenVault(oauthToken, recoveryWords, transport));
         }
     }
 }
